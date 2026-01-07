@@ -7,12 +7,12 @@ import matplotlib.pyplot as plt
 import io
 
 # ==========================================
-# 1. PARSER CERDAS (AUTO SCAN X & Y)
+# 1. PARSER CERDAS (AUTO SCAN X & Y DI MANA SAJA)
 # ==========================================
 def parse_pclp_smart(df):
     """
     Mencari pasangan baris X dan Y di kolom mana saja.
-    Tidak peduli X ada di kolom A, B, C, atau D, akan otomatis ketemu.
+    Otomatis mendeteksi koordinat meskipun kolom bergeser.
     """
     parsed_data = []
     i = 0
@@ -21,13 +21,14 @@ def parse_pclp_smart(df):
     while i < len(df):
         row = df.iloc[i]
         
-        # 1. SCANNING: Cari kolom mana yang isinya huruf 'X'
+        # 1. SCANNING: Cari di kolom mana huruf 'X' berada
         x_col_idx = -1
-        # Kita cek 10 kolom pertama saja (biasanya header ada di kiri)
-        max_col_check = min(10, len(row))
+        # Cek 15 kolom pertama (biasanya header ada di kiri)
+        max_col_check = min(15, len(row))
         
         for c in range(max_col_check):
             try:
+                # Bersihkan spasi dan ubah ke huruf besar
                 val = str(row[c]).strip().upper()
                 if val == 'X':
                     x_col_idx = c
@@ -35,7 +36,7 @@ def parse_pclp_smart(df):
             except:
                 continue
         
-        # 2. MATCHING: Jika ketemu X, cek baris bawahnya apakah Y?
+        # 2. MATCHING: Jika ketemu X, cek apakah baris bawahnya Y?
         if x_col_idx != -1 and (i + 1 < len(df)):
             row_next = df.iloc[i+1]
             try:
@@ -44,25 +45,25 @@ def parse_pclp_smart(df):
                 val_next = ""
                 
             if val_next == 'Y':
-                # --- KETEMU PASANGAN EMAS (X & Y) ---
+                # --- KETEMU PASANGAN X & Y ---
                 
-                # A. Ambil Nama STA
-                # Biasanya nama STA ada di sebelah kiri 'Y' (misal Y di kolom D, STA di kolom B)
-                # Kita coba cari mundur dari kolom Y
-                sta_name = f"Unknown_{i}"
+                # A. Ambil Nama STA (Biasanya mundur 2 kolom dari posisi Y)
+                sta_name = f"STA_{i}"
                 if x_col_idx >= 2:
-                    val_sta = str(row_next[x_col_idx - 2]).strip() # Coba 2 kolom ke kiri
-                    if val_sta and val_sta.lower() != 'nan':
-                        sta_name = val_sta
+                    try:
+                        val_sta = str(row_next[x_col_idx - 2]).strip() 
+                        if val_sta and val_sta.lower() != 'nan':
+                            sta_name = val_sta
+                    except:
+                        pass
                 
-                # Bersihkan nama STA (.0 di belakang angka)
+                # Bersihkan nama STA (buang .0 jika ada)
                 if sta_name.endswith('.0'): sta_name = sta_name[:-2]
                 
-                # B. Ambil Data Koordinat
-                # Data dimulai dari kolom SETELAH X (x_col_idx + 1)
+                # B. Ambil Data Koordinat (Mulai dari kolom setelah X)
                 start_data = x_col_idx + 1
                 
-                # Pastikan panjang baris sama
+                # Pastikan panjang baris aman
                 max_len = min(len(row), len(row_next))
                 x_vals = row[start_data:max_len].values
                 y_vals = row_next[start_data:max_len].values
@@ -97,7 +98,7 @@ def hitung_cut_fill(tanah_pts, desain_pts):
     if not tanah_pts or not desain_pts:
         return 0, 0
     
-    # Datum
+    # Datum (Dasar Referensi)
     all_y = [p[1] for p in tanah_pts] + [p[1] for p in desain_pts]
     datum = min(all_y) - 5.0
 
@@ -126,7 +127,7 @@ def generate_dxf_batch(all_results):
     if 'TEKS_DATA' not in doc.layers: doc.layers.add(name='TEKS_DATA', color=7)
 
     count = 0
-    jarak_antar_gambar = 60 # Jarak antar gambar di AutoCAD
+    jarak_antar_gambar = 60 
     
     for item in all_results:
         sta = item['STA']
@@ -140,7 +141,7 @@ def generate_dxf_batch(all_results):
         msp.add_lwpolyline(tanah_draw, dxfattribs={'layer': 'TANAH_ASLI'})
         msp.add_lwpolyline(desain_draw, dxfattribs={'layer': 'DESAIN_SALURAN'})
 
-        info_txt = f"STA: {sta}\\PCut: {item['cut']:.2f} m2\\PFill: {item['fill']:.2f} m2"
+        info_txt = f"STA: {sta}\nCut: {item['cut']:.2f} m2\nFill: {item['fill']:.2f} m2"
         
         center_x = sum(p[0] for p in tanah_draw) / len(tanah_draw)
         max_y = max(p[1] for p in tanah_draw)
@@ -160,12 +161,6 @@ def generate_dxf_batch(all_results):
 # ==========================================
 st.set_page_config(page_title="PCLP Ultimate", layout="wide")
 st.title("🚜 PCLP Ultimate: Auto-Scan Engine")
-
-st.markdown("""
-<style>
-div.stButton > button:first-child {background-color: #0099ff; color: white; font-size: 20px;}
-</style>
-""", unsafe_allow_html=True)
 
 st.sidebar.header("1. Upload Data")
 uploaded_file = st.sidebar.file_uploader("Upload Excel PCLP (.xls / .xlsx)", type=["xls", "xlsx"])
@@ -193,12 +188,13 @@ if uploaded_file:
         match_mode = st.sidebar.radio("Metode Pasangkan STA:", 
                                       ["Paksa Urutan (Disarankan)", "Cocokkan Nama STA"])
         
-        st.sidebar.info("Tips: Gunakan 'Paksa Urutan' jika nama STA di tanah & desain sering beda ketik.")
+        st.sidebar.info("Tips: Gunakan 'Paksa Urutan' jika nama STA sering beda ketik.")
 
         if st.sidebar.button("🚀 MULAI PROSES"):
             with st.spinner("🔍 Sedang scanning posisi X dan Y di Excel..."):
                 
                 # Baca Raw Data (Tanpa Header)
+                # Header=None penting agar baris 1-5 tidak dianggap judul kolom
                 df_ogl_raw = pd.read_excel(uploaded_file, sheet_name=sheet_ogl, header=None)
                 df_des_raw = pd.read_excel(uploaded_file, sheet_name=sheet_desain, header=None)
                 
@@ -207,7 +203,7 @@ if uploaded_file:
                 data_desain = parse_pclp_smart(df_des_raw)
                 
                 if not data_ogl:
-                    st.error(f"❌ Tidak ditemukan data Tanah di sheet '{sheet_ogl}'! Pastikan ada baris dengan kode 'X' dan 'Y'.")
+                    st.error(f"❌ Tidak ditemukan data Tanah di sheet '{sheet_ogl}'! Pastikan ada huruf 'X' dan 'Y' di salah satu kolom.")
                     st.stop()
                 
                 if not data_desain:
