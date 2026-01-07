@@ -1,4 +1,7 @@
 streamlit
+pandas
 ezdxf
 shapely
 matplotlib
+openpyxl
+xlrd
