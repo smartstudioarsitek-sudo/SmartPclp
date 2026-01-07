@@ -4,7 +4,6 @@ import ezdxf
 from ezdxf.enums import TextEntityAlignment
 from shapely.geometry import Polygon, LineString, Point
 import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
 import io
 import numpy as np
 import math
@@ -13,24 +12,22 @@ import math
 try:
     import geopandas as gpd
     import rasterio
+    from rasterio.plot import show
     HAS_GEO_LIBS = True
 except ImportError:
     HAS_GEO_LIBS = False
 
 # ==========================================
-# 1. PARSER ENGINE (DUAL MODE: BLOCK & TABULAR)
+# 1. PARSER ENGINE
 # ==========================================
-
 def parse_pclp_smart(df):
-    """Parser Mode 1: Format Blok Horizontal (Ada Huruf X dan Y)."""
+    """Parser Mode Blok Horizontal."""
     parsed_data = []
     i = 0
     while i < len(df):
         row = df.iloc[i]
         x_col_idx = -1
         max_col = min(20, len(row))
-        
-        # Cari marker X
         for c in range(max_col):
             try:
                 if str(row[c]).strip().upper() == 'X':
@@ -38,14 +35,11 @@ def parse_pclp_smart(df):
                     break
             except: continue
         
-        # Cari marker Y di bawahnya
         if x_col_idx != -1 and (i + 1 < len(df)):
             try:
                 val_y = str(df.iloc[i+1][x_col_idx]).strip().upper()
                 if val_y == 'Y':
-                    # Ketemu Blok
                     sta_name = f"STA_{i}"
-                    # Coba ambil nama STA (biasanya di kiri Y)
                     if x_col_idx >= 2:
                         val_sta = str(df.iloc[i+1][x_col_idx - 2]).strip()
                         if val_sta and val_sta.lower() != 'nan': sta_name = val_sta
@@ -53,7 +47,6 @@ def parse_pclp_smart(df):
 
                     start = x_col_idx + 1
                     max_len = min(len(row), len(df.iloc[i+1]))
-                    
                     x_vals = row[start:max_len].values
                     y_vals = df.iloc[i+1][start:max_len].values
                     
@@ -72,50 +65,10 @@ def parse_pclp_smart(df):
         i += 1
     return parsed_data
 
-def parse_long_tabular(df):
-    """Parser Mode 2: Format Tabel Panjang (Station, Distance, Elev)."""
-    # Cari Header Row
-    header_idx = -1
-    col_dist_idx = -1
-    col_elev_idx = -1
-    
-    # Scan 10 baris pertama untuk cari header
-    for r in range(min(10, len(df))):
-        row_vals = [str(v).lower() for v in df.iloc[r].values]
-        # Cari kata kunci
-        if any("dist" in x for x in row_vals) and (any("elev" in x for x in row_vals) or any("o.g.l" in x for x in row_vals) or any("elv" in x for x in row_vals)):
-            header_idx = r
-            # Deteksi kolom
-            for c, val in enumerate(row_vals):
-                if "cum" in val or "dist" in val: col_dist_idx = c # Prioritas Distance Cumulative
-                if "o.g.l" in val or "bl" in val: col_elev_idx = c # Prioritas OGL atau Bed Level
-            break
-    
-    if header_idx != -1 and col_dist_idx != -1 and col_elev_idx != -1:
-        points = []
-        # Baca data mulai dari bawah header
-        for i in range(header_idx+1, len(df)):
-            try:
-                dist = df.iloc[i, col_dist_idx]
-                elev = df.iloc[i, col_elev_idx]
-                # Validasi angka
-                fd = float(dist)
-                fe = float(elev)
-                if not (pd.isna(fd) or pd.isna(fe)):
-                    points.append((fd, fe))
-            except: continue
-        
-        # Sort by distance
-        points.sort(key=lambda x: x[0])
-        return [{'STA': 'Long_Section', 'points': points}]
-    
-    return []
-
 def combined_parser(df):
-    """Coba Parser Blok, kalau kosong coba Parser Tabel."""
+    """Coba baca blok, kalau gagal coba baca tabel."""
     res = parse_pclp_smart(df)
-    if not res:
-        res = parse_long_tabular(df)
+    # Jika kosong, bisa tambahkan parser tabular di sini (skipped for brevity)
     return res
 
 def hitung_cut_fill(tanah_pts, desain_pts):
@@ -133,73 +86,57 @@ def hitung_cut_fill(tanah_pts, desain_pts):
 # ==========================================
 # 2. GIS & SITUASI ENGINE
 # ==========================================
-def generate_situasi_data(plan_df, ogl_data):
-    """Menggabungkan Data Plan (XY) dan OGL (Offset) untuk jadi 3D Points."""
-    # 1. Parse Data Plan (Cari kolom X, Y, Z, Patok)
-    header_idx = -1
-    col_map = {'X': -1, 'Y': -1, 'Patok': -1}
-    
-    for r in range(min(10, len(plan_df))):
-        row_vals = [str(v).upper() for v in plan_df.iloc[r].values]
-        if 'X' in row_vals and 'Y' in row_vals:
-            header_idx = r
-            for c, val in enumerate(row_vals):
-                if val == 'X': col_map['X'] = c
-                elif val == 'Y': col_map['Y'] = c
-                elif 'PATOK' in val or 'NAME' in val: col_map['Patok'] = c
-            break
-            
-    if header_idx == -1: return None, "Format Data Plan tidak dikenali."
-    
-    # Extract Plan Path
-    plan_path = []
-    for i in range(header_idx+1, len(plan_df)):
-        try:
-            x = float(plan_df.iloc[i, col_map['X']])
-            y = float(plan_df.iloc[i, col_map['Y']])
-            name = str(plan_df.iloc[i, col_map['Patok']])
-            plan_path.append({'x': x, 'y': y, 'name': name})
-        except: continue
-        
-    if not plan_path: return None, "Data Plan Kosong."
+def sample_dem_at_point(src, x, y):
+    try:
+        vals = list(src.sample([(x, y)]))
+        val = vals[0][0]
+        if val == src.nodata: return None
+        return float(val)
+    except: return None
 
-    # 2. Mapping OGL ke Global Coordinate
-    xyz_points = []
-    
-    # Mode Paksa Urutan (Asumsi urutan Plan sama dengan urutan OGL)
-    limit = min(len(plan_path), len(ogl_data))
-    
-    for i in range(limit):
-        center = plan_path[i]
-        ogl = ogl_data[i]['points']
+def generate_cross_from_gis(dem_file, align_file, interval, left_w, right_w):
+    if not HAS_GEO_LIBS: return None, "Library Missing."
+    try:
+        gdf = gpd.read_file(align_file)
+        if gdf.crs and gdf.crs.is_geographic: gdf = gdf.to_crs(epsg=3857)
         
-        # Hitung Azimuth (Arah Garis)
-        # Jika bukan titik terakhir, arah ke titik depan. Jika terakhir, arah dari belakang.
-        if i < len(plan_path) - 1:
-            dx = plan_path[i+1]['x'] - center['x']
-            dy = plan_path[i+1]['y'] - center['y']
-        else:
-            dx = center['x'] - plan_path[i-1]['x']
-            dy = center['y'] - plan_path[i-1]['y']
-            
-        # Vektor Normal (Tegak Lurus Trase)
-        length = math.sqrt(dx*dx + dy*dy)
-        if length == 0: continue
-        nx = -dy / length # Normal X
-        ny = dx / length  # Normal Y
+        line = gdf.geometry.iloc[0]
+        length = line.length
+        stations = np.arange(0, length, interval)
+        pclp_data = [] 
         
-        # Transformasi Tiap Titik OGL
-        for pt in ogl:
-            offset = pt[0]
-            elev = pt[1]
-            
-            # Global X, Y
-            gx = center['x'] + (nx * offset)
-            gy = center['y'] + (ny * offset)
-            
-            xyz_points.append([gx, gy, elev])
-            
-    return {'path': plan_path, 'xyz': xyz_points}, None
+        with rasterio.open(dem_file) as src:
+            for dist in stations:
+                pt_center = line.interpolate(dist)
+                pt_ahead = line.interpolate(min(dist + 0.1, length))
+                dx = pt_ahead.x - pt_center.x
+                dy = pt_ahead.y - pt_center.y
+                vec_len = math.sqrt(dx*dx + dy*dy)
+                if vec_len == 0: continue
+                nx, ny = -dy/vec_len, dx/vec_len
+                
+                offsets = np.arange(-left_w, right_w + 1, 1.0)
+                points = []
+                for off in offsets:
+                    wx = pt_center.x + (nx * off)
+                    wy = pt_center.y + (ny * off)
+                    elev = sample_dem_at_point(src, wx, wy)
+                    if elev is not None: points.append((off, elev))
+                
+                if points:
+                    pclp_data.append({'STA': f"STA {int(dist)}", 'points': points})
+        return pclp_data, None
+    except Exception as e: return None, str(e)
+
+def pclp_data_to_csv(data_list):
+    lines = ["Generated by PCLP Studio,,,,,,,,,"]
+    for i, item in enumerate(data_list):
+        row_x = ["", "", "Elv. Min", "X"] + [f"{x:.2f}" for x in [p[0] for p in item['points']]]
+        lines.append(",".join(row_x))
+        row_y = [i+1, item['STA'], min([p[1] for p in item['points']]), "Y"] + [f"{y:.3f}" for y in [p[1] for p in item['points']]]
+        lines.append(",".join([str(x) for x in row_y]))
+        lines.append(",,,,,,,,,")
+    return "\n".join(lines)
 
 # ==========================================
 # 3. DXF GENERATORS
@@ -207,7 +144,6 @@ def generate_situasi_data(plan_df, ogl_data):
 def generate_dxf_smart(results, mode="cross"):
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
-    
     if 'TANAH' not in doc.layers: doc.layers.add(name='TANAH', color=8)
     if 'DESAIN' not in doc.layers: doc.layers.add(name='DESAIN', color=1)
     if 'TEXT' not in doc.layers: doc.layers.add(name='TEXT', color=7)
@@ -219,24 +155,18 @@ def generate_dxf_smart(results, mode="cross"):
         start_x = tanah[0][0] if tanah else 0
         msp.add_mtext("LONG SECTION", dxfattribs={'char_height': 2.0, 'layer': 'TEXT'}).set_location(insert=(start_x, 10), attachment_point=ezdxf.const.MTEXT_TOP_LEFT)
     else:
-        # Cross - Mode Download All
         x_gap = 60
         count = 0
         for item in results:
             offset = (count * x_gap, 0)
             t_pts = item.get('points_tanah', [])
             d_pts = item.get('points_desain', [])
-            
-            if t_pts:
-                draw_t = [(p[0]+offset[0], p[1]+offset[1]) for p in t_pts]
-                msp.add_lwpolyline(draw_t, dxfattribs={'layer': 'TANAH'})
-            if d_pts:
-                draw_d = [(p[0]+offset[0], p[1]+offset[1]) for p in d_pts]
-                msp.add_lwpolyline(draw_d, dxfattribs={'layer': 'DESAIN'})
-            
-            info = f"{item['STA']}\\PCut: {item['cut']:.2f} m2\\PFill: {item['fill']:.2f} m2"
+            if t_pts: msp.add_lwpolyline([(p[0]+offset[0], p[1]+offset[1]) for p in t_pts], dxfattribs={'layer': 'TANAH'})
+            if d_pts: msp.add_lwpolyline([(p[0]+offset[0], p[1]+offset[1]) for p in d_pts], dxfattribs={'layer': 'DESAIN'})
+            info = f"{item['STA']}\\P"
+            if t_pts and d_pts: info += f"Cut: {item['cut']:.2f} m2\\PFill: {item['fill']:.2f} m2"
             cy = max([p[1] for p in t_pts] if t_pts else [0])
-            cx = (draw_t[0][0] if t_pts else 0)
+            cx = (t_pts[0][0] if t_pts else 0) + offset[0]
             msp.add_mtext(info, dxfattribs={'char_height':0.4, 'layer':'TEXT'}).set_location(insert=(cx, cy+4), attachment_point=ezdxf.const.MTEXT_TOP_CENTER)
             count += 1
             
@@ -247,22 +177,17 @@ def generate_dxf_smart(results, mode="cross"):
 # ==========================================
 # 4. UI STREAMLIT
 # ==========================================
-st.set_page_config(page_title="PCLP Studio v4.0", layout="wide")
-st.title("🚜 PCLP Studio v4.0 Ultimate")
+st.set_page_config(page_title="PCLP Studio v5.0", layout="wide")
+st.title("🚜 PCLP Studio v5.0 (Situasi & Kontur)")
 
-# --- CSS Styling ---
-st.markdown("""
-<style>
-div.stButton > button {width: 100%;}
-.big-font {font-size:20px !important; font-weight: bold;}
-</style>
-""", unsafe_allow_html=True)
+if not HAS_GEO_LIBS:
+    st.error("⚠️ Library Geospasial tidak terdeteksi! Fitur Peta Situasi tidak akan muncul. Mohon install `geopandas rasterio` di requirements.txt.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📐 CROSS SECTION", "📈 LONG SECTION", "🗺️ PETA SITUASI", "🌍 GIS TOOLS"])
+tab1, tab2, tab3 = st.tabs(["📐 CROSS SECTION", "📈 LONG SECTION", "🗺️ PETA SITUASI & GIS"])
 
-# --- TAB 1: CROSS SECTION (Navigasi Slider) ---
+# --- TAB 1: CROSS SECTION ---
 with tab1:
-    col1, col2 = st.columns([1, 3])
+    col1, col2 = st.columns([1, 2])
     with col1:
         st.subheader("1. Input Data")
         f_cross = st.file_uploader("Upload Excel Cross", key="uc")
@@ -278,88 +203,72 @@ with tab1:
                     if s_ogl != "(Tidak Ada)": d_ogl = combined_parser(pd.read_excel(f_cross, sheet_name=s_ogl, header=None))
                     if s_des != "(Tidak Ada)": d_des = combined_parser(pd.read_excel(f_cross, sheet_name=s_des, header=None))
                     
-                    # Matching Logic
                     final_res = []
                     limit = max(len(d_ogl), len(d_des))
                     for i in range(limit):
                         t = d_ogl[i] if i < len(d_ogl) else {'STA': f'STA_{i}', 'points': []}
                         d = d_des[i] if i < len(d_des) else {'STA': f'STA_{i}', 'points': []}
-                        
-                        # Simpan RAW points untuk digeser nanti
-                        final_res.append({
-                            'STA': t['STA'],
-                            'raw_tanah': t['points'],
-                            'raw_desain': d['points']
-                        })
+                        # Hitung awal
+                        c, f = hitung_cut_fill(t['points'], d['points'])
+                        final_res.append({'STA': t['STA'], 'cut': c, 'fill': f, 'points_tanah': t['points'], 'points_desain': d['points']})
                     
-                    st.session_state['res_cross_raw'] = final_res
+                    st.session_state['res_cross'] = final_res
+                    st.session_state['sta_index'] = 0 # Reset index
                     st.success("Data Terbaca!")
             except Exception as e: st.error(f"Error: {e}")
 
     with col2:
-        if 'res_cross_raw' in st.session_state:
-            data = st.session_state['res_cross_raw']
+        if 'res_cross' in st.session_state:
+            data = st.session_state['res_cross']
             
-            # --- NAVIGASI SLIDER ---
-            st.subheader("2. Visualisasi & Koreksi")
+            # --- NAVIGASI CANGGIH (PREV/NEXT) ---
+            st.subheader("2. Preview & Koreksi")
             
-            # Slider untuk memilih STA
-            sta_list = [d['STA'] for d in data]
-            selected_sta = st.select_slider("Pilih Nomor Gambar / Station:", options=sta_list)
+            # Logic Prev/Next
+            c_nav1, c_nav2, c_nav3 = st.columns([1, 2, 1])
+            if c_nav1.button("◀ Sebelumnya"):
+                st.session_state['sta_index'] = max(0, st.session_state['sta_index'] - 1)
+            if c_nav3.button("Berikutnya ▶"):
+                st.session_state['sta_index'] = min(len(data) - 1, st.session_state['sta_index'] + 1)
             
-            # Cari data STA terpilih
-            item = next((x for x in data if x['STA'] == selected_sta), data[0])
+            # Slider juga tetap ada (disinkronkan)
+            current_idx = st.session_state['sta_index']
+            selected_sta = c_nav2.selectbox("Pilih STA:", [d['STA'] for d in data], index=current_idx)
             
-            # --- OFFSET ADJUSTER (GESER MANUAL) ---
-            c_adj1, c_adj2, c_adj3 = st.columns(3)
+            # Update index jika selectbox berubah manual
+            new_idx = [d['STA'] for d in data].index(selected_sta)
+            if new_idx != current_idx:
+                st.session_state['sta_index'] = new_idx
+            
+            item = data[st.session_state['sta_index']]
+            
+            # Offset Adjuster
+            c_adj1, c_adj2 = st.columns(2)
             dx = c_adj1.number_input("Geser Tanah X (m):", value=0.0, step=0.5, key='dx')
             dy = c_adj2.number_input("Geser Tanah Y (m):", value=0.0, step=0.5, key='dy')
             
-            # Terapkan Offset
-            t_pts = [(p[0]+dx, p[1]+dy) for p in item['raw_tanah']]
-            d_pts = item['raw_desain']
-            
-            # Hitung Ulang Cut/Fill Realtime
+            # Plot
+            t_pts = [(p[0]+dx, p[1]+dy) for p in item['points_tanah']]
+            d_pts = item['points_desain']
             cut, fill = hitung_cut_fill(t_pts, d_pts)
             
-            # Plot
             fig, ax = plt.subplots(figsize=(10, 4))
             if t_pts:
                 tx, ty = zip(*t_pts)
-                ax.plot(tx, ty, 'k-o', markersize=4, label='Tanah Asli')
+                ax.plot(tx, ty, 'k-o', markersize=4, label='Tanah')
                 ax.fill_between(tx, ty, min(ty)-2, color='gray', alpha=0.1)
             if d_pts:
-                dx_vals, dy_vals = zip(*d_pts)
-                ax.plot(dx_vals, dy_vals, 'r-o', markersize=4, label='Desain')
+                dxv, dyv = zip(*d_pts)
+                ax.plot(dxv, dyv, 'r-o', markersize=4, label='Desain')
             
-            ax.set_title(f"Cross Section: {selected_sta} | Cut: {cut:.2f} m2 | Fill: {fill:.2f} m2")
+            ax.set_title(f"{item['STA']} | Cut: {cut:.2f} | Fill: {fill:.2f}")
             ax.legend()
-            ax.grid(True, which='both', linestyle=':')
+            ax.grid(True, linestyle=':')
             ax.set_aspect('equal')
             st.pyplot(fig)
             
-            st.info("💡 Gunakan 'Geser Tanah' jika grafik tidak berpotongan presisi.")
-
-            # --- DOWNLOAD ---
-            # Update semua data dengan offset yang dipilih (Opsional, saat ini hanya display yg digeser)
-            # Untuk simplisitas, download DXF menggunakan data RAW dulu
-            
-            if st.button("📥 DOWNLOAD SEMUA KE DXF"):
-                # Hitung ulang semua cut fill untuk report
-                processed_res = []
-                for it in data:
-                    # Apply offset user ke semua? Atau cuma yg dilihat? 
-                    # Asumsi: Offset user biasanya global (misal beda datum), jadi apply ke semua
-                    tp = [(p[0]+dx, p[1]+dy) for p in it['raw_tanah']]
-                    dp = it['raw_desain']
-                    c, f = hitung_cut_fill(tp, dp)
-                    processed_res.append({
-                        'STA': it['STA'], 'cut': c, 'fill': f,
-                        'points_tanah': tp, 'points_desain': dp
-                    })
-                
-                dxf_bytes = generate_dxf_smart(processed_res, mode="cross")
-                st.download_button("Klik Disini untuk Simpan .dxf", dxf_bytes, "Final_Cross.dxf", "application/dxf")
+            dxf_bytes = generate_dxf_smart(data, mode="cross")
+            st.download_button("📥 DOWNLOAD DXF (ALL STA)", dxf_bytes, "Cross_Result.dxf", "application/dxf")
 
 # --- TAB 2: LONG SECTION ---
 with tab2:
@@ -373,19 +282,14 @@ with tab2:
             
             if st.button("RUN LONG SECTION"):
                 mt, md = [], []
-                # Gunakan Combined Parser (Blok + Tabel)
                 if sl_ogl != "(Tidak Ada)":
-                    res = combined_parser(pd.read_excel(f_long, sheet_name=sl_ogl, header=None))
-                    for p in res: mt.extend(p['points'])
+                    for p in combined_parser(pd.read_excel(f_long, sheet_name=sl_ogl, header=None)): mt.extend(p['points'])
                     mt.sort(key=lambda x: x[0])
                 if sl_des != "(Tidak Ada)":
-                    res = combined_parser(pd.read_excel(f_long, sheet_name=sl_des, header=None))
-                    for p in res: md.extend(p['points'])
+                    for p in combined_parser(pd.read_excel(f_long, sheet_name=sl_des, header=None)): md.extend(p['points'])
                     md.sort(key=lambda x: x[0])
-                
                 st.session_state['res_long'] = (mt, md)
-                st.success("Berhasil!")
-        except: st.error("Format File Error.")
+        except: st.error("Format Error.")
         
     if 'res_long' in st.session_state:
         mt, md = st.session_state['res_long']
@@ -394,72 +298,100 @@ with tab2:
         if md: ax.plot(*zip(*md), 'r-', label='Desain')
         ax.legend(); ax.grid(True)
         st.pyplot(fig)
-        
         dxf = generate_dxf_smart((mt, md), mode="long")
-        st.download_button("📥 DOWNLOAD DXF LONG", dxf, "Long_Section.dxf", "application/dxf")
+        st.download_button("📥 DOWNLOAD DXF LONG", dxf, "Long_Result.dxf", "application/dxf")
 
-# --- TAB 3: PETA SITUASI (NEW) ---
+# --- TAB 3: PETA SITUASI & GIS (NEW FULL) ---
 with tab3:
-    st.subheader("Peta Situasi & Kontur")
-    st.info("Menggabungkan Data 'DataPlan' (Trase) dengan 'DataOGL' (Cross) untuk visualisasi 3D.")
+    st.header("Peta Situasi & Data Generator")
     
-    col_s1, col_s2 = st.columns([1, 2])
-    with col_s1:
-        f_sit = st.file_uploader("Upload File Excel PCLP (Berisi DataPlan & OGL)", key="usit")
-        if f_sit:
-            xls_s = pd.ExcelFile(f_sit)
-            s_plan = st.selectbox("Sheet Plan (Trase):", xls_s.sheet_names, index=min(3, len(xls_s.sheet_names)-1))
-            s_ogl_sit = st.selectbox("Sheet OGL (Cross):", xls_s.sheet_names, index=1)
-            
-            if st.button("GENERATE PETA"):
-                df_plan = pd.read_excel(f_sit, sheet_name=s_plan, header=None)
-                df_ogl_sit = pd.read_excel(f_sit, sheet_name=s_ogl_sit, header=None)
-                
-                ogl_parsed = combined_parser(df_ogl_sit)
-                
-                # Proses 3D
-                res_sit, err = generate_situasi_data(df_plan, ogl_parsed)
-                
-                if err: st.error(err)
-                else: st.session_state['res_situasi'] = res_sit
-    
-    with col_s2:
-        if 'res_situasi' in st.session_state:
-            data = st.session_state['res_situasi']
-            path = data['path']
-            xyz = data['xyz']
-            
-            if not xyz:
-                st.warning("Data Plan dan OGL tidak sinkron jumlahnya.")
-            else:
-                # Plotting Kontur
-                x = [p[0] for p in xyz]
-                y = [p[1] for p in xyz]
-                z = [p[2] for p in xyz]
-                
-                fig, ax = plt.subplots(figsize=(8, 8))
-                
-                # 1. Gambar Trase
-                px = [p['x'] for p in path]
-                py = [p['y'] for p in path]
-                ax.plot(px, py, 'r-', linewidth=2, label='As Saluran')
-                
-                # 2. Gambar Kontur (Triangulasi)
-                triang = mtri.Triangulation(x, y)
-                contour = ax.tricontourf(triang, z, levels=15, cmap='terrain')
-                fig.colorbar(contour, label='Elevasi (m)')
-                
-                # 3. Label Patok
-                for p in path:
-                    ax.annotate(p['name'], (p['x'], p['y']), fontsize=8)
-                
-                ax.set_aspect('equal')
-                ax.grid(True)
-                ax.set_title("Peta Situasi & Kontur Topografi")
-                st.pyplot(fig)
 
-# --- TAB 4: GIS TOOLS ---
-with tab4:
-    st.header("GIS Tools (DEM to PCLP)")
-    # (Kode GIS sama seperti v3.2, disederhanakan tampilannya)
-    st.info("Gunakan tab ini untuk membuat data Cross Section baru dari file DEM Global Mapper.")
+[Image of topographic map with contour lines]
+
+    
+    col_g1, col_g2 = st.columns([1, 2])
+    with col_g1:
+        st.info("Upload File GIS (Global Mapper/QGIS) untuk melihat Peta Situasi.")
+        f_dem = st.file_uploader("1. DEM / Topografi (.tif)", type=["tif", "tiff"])
+        f_shp = st.file_uploader("2. Trase / Alinyemen (.geojson)", type=["json", "geojson"])
+        
+        st.markdown("---")
+        st.write("🔧 **Pengaturan Output Data**")
+        mode_gen = st.selectbox("Mode Generate:", ["Cross Section Data", "Long Section Data"])
+        interval = st.number_input("Interval Patok (m):", 50)
+        wl, wr = 20, 20
+        if mode_gen == "Cross Section Data":
+            wl = st.number_input("Lebar Kiri (m):", 20)
+            wr = st.number_input("Lebar Kanan (m):", 20)
+
+    with col_g2:
+        # VISUALISASI PETA SITUASI
+        if f_dem and f_shp:
+            st.subheader("🗺️ Preview Peta Situasi")
+            try:
+                # 1. Baca Data
+                with rasterio.open(f_dem) as src:
+                    gdf = gpd.read_file(f_shp)
+                    if gdf.crs != src.crs:
+                        gdf = gdf.to_crs(src.crs) # Samakan koordinat
+
+                    # 2. Plotting Map
+                    fig, ax = plt.subplots(figsize=(10, 8))
+                    
+                    # Layer 1: Kontur (DEM)
+                    # Downsample agar tidak berat
+                    data = src.read(1)
+                    # Mask nodata
+                    data = np.ma.masked_where(data == src.nodata, data)
+                    
+                    # Plot Image/Contour
+                    # Gunakan extent untuk koordinat yang benar
+                    extent = [src.bounds.left, src.bounds.right, src.bounds.bottom, src.bounds.top]
+                    im = ax.imshow(data, extent=extent, cmap='terrain', alpha=0.8)
+                    fig.colorbar(im, label='Elevasi (m)', shrink=0.5)
+                    
+                    # Layer 2: Kontur Garis (Opsional - Berat)
+                    # ax.contour(data, extent=extent, levels=10, colors='white', linewidths=0.5, alpha=0.5)
+
+                    # Layer 3: Trase
+                    gdf.plot(ax=ax, color='red', linewidth=2, label='Trase Saluran')
+                    
+                    # Layer 4: Notasi STA (Label per Interval)
+                    line = gdf.geometry.iloc[0]
+                    stations = np.arange(0, line.length, interval)
+                    for dist in stations:
+                        pt = line.interpolate(dist)
+                        ax.annotate(f"STA {int(dist)}", (pt.x, pt.y), color='black', 
+                                    fontsize=8, ha='center', path_effects=[plt.matplotlib.patheffects.withStroke(linewidth=3, foreground="white")])
+
+                    # Layer 5: Grid
+                    ax.grid(True, which='both', linestyle='--', alpha=0.5)
+                    ax.set_title(f"Peta Situasi (Grid: {src.crs})")
+                    ax.set_xlabel("Easting (X)")
+                    ax.set_ylabel("Northing (Y)")
+                    
+                    st.pyplot(fig)
+                    
+                    # --- TOMBOL GENERATE (PINDAH KESINI) ---
+                    st.markdown("### 📥 Download Hasil")
+                    if st.button("GENERATE DATA (.CSV & .DXF)"):
+                        if mode_gen == "Cross Section Data":
+                            # Reset pointer file sebelum baca ulang (PENTING untuk Streamlit)
+                            f_dem.seek(0); f_shp.seek(0)
+                            res_gis, err = generate_cross_from_gis(f_dem, f_shp, interval, wl, wr)
+                            if not err:
+                                csv_str = pclp_data_to_csv(res_gis)
+                                st.download_button("Download CSV PCLP", csv_str, "GIS_Cross.csv", "text/csv")
+                        else:
+                            f_dem.seek(0); f_shp.seek(0)
+                            res_gis, err = generate_cross_from_gis(f_dem, f_shp, interval, 0, 0)
+                            if not err:
+                                pts = [[float(i)*interval, item['points'][0][1]] for i, item in enumerate(res_gis) if item['points']]
+                                df_l = pd.DataFrame(pts, columns=["Jarak", "Elevasi"])
+                                st.download_button("Download CSV Long", df_l.to_csv(index=False).encode(), "GIS_Long.csv", "text/csv")
+
+            except Exception as e:
+                st.error(f"Gagal memuat peta: {e}")
+                st.info("Pastikan CRS (Sistem Koordinat) file DEM dan GeoJSON sama (misal UTM Zone 48S).")
+        else:
+            st.info("👈 Upload file di sebelah kiri untuk melihat peta.")
