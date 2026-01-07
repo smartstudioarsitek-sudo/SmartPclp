@@ -4,5 +4,6 @@ ezdxf
 shapely
 matplotlib
 openpyxl
+xlrd>=2.0.1
 geopandas
 rasterio
