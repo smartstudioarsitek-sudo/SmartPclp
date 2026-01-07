@@ -7,7 +7,46 @@ import matplotlib.pyplot as plt
 import io
 
 # ==========================================
-# 1. PARSER CERDAS (AUTO SCAN X & Y DI MANA SAJA)
+# 1. MODUL GENERATOR TEMPLATE EXCEL
+# ==========================================
+def create_template_excel():
+    """Membuat file Excel dummy sesuai format PCLP Horizontal."""
+    buffer = io.BytesIO()
+    
+    # --- Data Dummy Tanah (OGL) ---
+    # Format: Baris 1=Header X, Baris 2=Data Y
+    data_ogl = [
+        ["Project:", "Latihan Streamlit", "", "", "", "", "", "", ""],
+        ["", "", "", "", "", "", "", "", ""],
+        ["No.", "Name", "Elv. Min", "X", -10, -5, 0, 5, 10], # Baris X
+        [1, "STA 0+000", 98.0, "Y", 100, 99, 98, 99, 100],    # Baris Y
+        ["", "", "", "", "", "", "", "", ""], # Jeda
+        ["No.", "Name", "Elv. Min", "X", -10, -5, 0, 5, 10], 
+        [2, "STA 0+050", 99.0, "Y", 101, 100, 99, 100, 101],
+    ]
+    
+    # --- Data Dummy Desain ---
+    data_desain = [
+        ["Project:", "Desain Saluran", "", "", "", "", "", "", ""],
+        ["", "", "", "", "", "", "", "", ""],
+        ["No.", "Name", "Data", "X", -3, -1, 1, 3, ""],      # Baris X
+        [1, "STA 0+000", "", "Y", 99, 97, 97, 99, ""],       # Baris Y
+        ["", "", "", "", "", "", "", "", ""],
+        ["No.", "Name", "Data", "X", -3, -1, 1, 3, ""],
+        [2, "STA 0+050", "", "Y", 100, 98, 98, 100, ""],
+    ]
+
+    df_ogl = pd.DataFrame(data_ogl)
+    df_des = pd.DataFrame(data_desain)
+
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_ogl.to_excel(writer, sheet_name='DataOGL', index=False, header=False)
+        df_des.to_excel(writer, sheet_name='DataDesign', index=False, header=False)
+        
+    return buffer.getvalue()
+
+# ==========================================
+# 2. PARSER CERDAS (AUTO SCAN X & Y)
 # ==========================================
 def parse_pclp_smart(df):
     """
@@ -92,7 +131,7 @@ def parse_pclp_smart(df):
     return parsed_data
 
 # ==========================================
-# 2. ENGINE PERHITUNGAN
+# 3. ENGINE PERHITUNGAN
 # ==========================================
 def hitung_cut_fill(tanah_pts, desain_pts):
     if not tanah_pts or not desain_pts:
@@ -146,10 +185,9 @@ def generate_dxf_batch(all_results):
         center_x = sum(p[0] for p in tanah_draw) / len(tanah_draw)
         max_y = max(p[1] for p in tanah_draw)
         
-        msp.add_mtext(info_txt, dxfattribs={'char_height': 0.5, 'layer': 'TEKS_DATA'}).set_location(
-            insert=(center_x, max_y + 3.0),
-            attachment_point=ezdxf.const.MTEXT_TOP_CENTER
-        )
+        text = msp.add_text(info_txt, dxfattribs={'height': 0.4, 'layer': 'TEKS_DATA'})
+        text.set_placement((center_x, max_y + 3.0), align=TextEntityAlignment.CENTER)
+        
         count += 1
 
     output = io.StringIO()
@@ -157,12 +195,29 @@ def generate_dxf_batch(all_results):
     return output.getvalue().encode('utf-8')
 
 # ==========================================
-# 3. INTERFACE APLIKASI
+# 4. INTERFACE APLIKASI
 # ==========================================
 st.set_page_config(page_title="PCLP Ultimate", layout="wide")
 st.title("🚜 PCLP Ultimate: Auto-Scan Engine")
 
-st.sidebar.header("1. Upload Data")
+st.markdown("""
+<style>
+div.stButton > button:first-child {background-color: #0099ff; color: white; font-size: 20px;}
+</style>
+""", unsafe_allow_html=True)
+
+# --- SIDEBAR: DOWNLOAD TEMPLATE & UPLOAD ---
+st.sidebar.header("1. Persiapan Data")
+template_bytes = create_template_excel()
+st.sidebar.download_button(
+    label="📥 Download Template Excel Kosong",
+    data=template_bytes,
+    file_name="Template_PCLP.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+st.sidebar.markdown("---")
+
+st.sidebar.header("2. Upload Data Proyek")
 uploaded_file = st.sidebar.file_uploader("Upload Excel PCLP (.xls / .xlsx)", type=["xls", "xlsx"])
 
 if uploaded_file:
@@ -174,7 +229,7 @@ if uploaded_file:
         st.sidebar.success("✅ File Terbaca!")
         
         # Pilih Sheet
-        st.sidebar.subheader("2. Pilih Sheet Data")
+        st.sidebar.subheader("3. Konfigurasi Sheet")
         sheet_ogl = st.sidebar.selectbox("Sheet Tanah Asli:", sheet_names, index=0)
         
         # Auto-detect sheet desain
@@ -184,7 +239,7 @@ if uploaded_file:
         sheet_desain = st.sidebar.selectbox("Sheet Desain:", sheet_names, index=idx_des)
 
         # Opsi Matching
-        st.sidebar.subheader("3. Opsi Proses")
+        st.sidebar.subheader("4. Opsi Proses")
         match_mode = st.sidebar.radio("Metode Pasangkan STA:", 
                                       ["Paksa Urutan (Disarankan)", "Cocokkan Nama STA"])
         
@@ -203,7 +258,7 @@ if uploaded_file:
                 data_desain = parse_pclp_smart(df_des_raw)
                 
                 if not data_ogl:
-                    st.error(f"❌ Tidak ditemukan data Tanah di sheet '{sheet_ogl}'! Pastikan ada huruf 'X' dan 'Y' di salah satu kolom.")
+                    st.error(f"❌ Tidak ditemukan data Tanah di sheet '{sheet_ogl}'! Pastikan ada baris dengan kode 'X' dan 'Y'.")
                     st.stop()
                 
                 if not data_desain:
