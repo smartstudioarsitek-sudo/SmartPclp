@@ -11,5 +11,6 @@ fiona
 scipy
 numpy
 matplotlib
-protobuf>=4.21.0
+streamlit-folium
+
 
