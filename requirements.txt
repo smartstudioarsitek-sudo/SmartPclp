@@ -10,3 +10,11 @@ folium
 streamlit-folium
 scikit-image
 protobuf>=4.21.0
+leafmap
+shapely
+pysheds
+pystac-client
+planetary-computer
+rioxarray
+fiona
+scipy
