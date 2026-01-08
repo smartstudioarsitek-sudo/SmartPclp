@@ -19,6 +19,7 @@ rasterio
 pystac-client
 planetary-computer
 xlsxwriter
+localtileserver
 
 
 
