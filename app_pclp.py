@@ -42,14 +42,25 @@ st.set_page_config(page_title="Smart PCLP Studio: Integrated", layout="wide", pa
 # ==============================================================================
 
 class HydroEngine:
-    """Mesin untuk memproses DEM dan Delineasi DAS (Fitur Lama)"""
+    """Mesin untuk memproses DEM dan Delineasi DAS (Fixed Version)"""
     def __init__(self, dem_path):
-        # Membaca file DEM fisik (tempfile)
+        # 1. Inisialisasi Grid dari file (Metadata)
         self.grid = Grid.from_raster(dem_path)
+        
+        # 2. BACA DATA RASTER SECARA EKSPLISIT
+        # Ini langkah yang sebelumnya kurang. Kita harus baca isinya dulu.
+        dem_data = self.grid.read_raster(dem_path)
+        
+        # 3. Masukkan data ke dalam Grid dengan nama 'dem'
+        # Agar fungsi view('dem') nanti bisa menemukannya.
+        self.grid.add_gridded_data(dem_data, data_name='dem', affine=self.grid.affine, crs=self.grid.crs)
+        
+        # 4. Set view (Sekarang aman karena data 'dem' sudah ada)
         self.dem = self.grid.view('dem')
 
     def condition_dem(self):
         # Fill depressions / Pits
+        # Mengisi cekungan agar air bisa mengalir
         self.grid.fill_depressions('dem', out_name='flooded_dem')
         self.grid.resolve_flats('flooded_dem', out_name='inflated_dem')
         
@@ -65,30 +76,32 @@ class HydroEngine:
         xy = (x, y)
         
         # Cari titik akumulasi tertinggi di sekitar klik (Radius kecil)
-        # Note: Ini versi sederhana, idealnya snapping cari max acc
-        snapped_xy = self.grid.snap_to_mask(self.grid.acc > 100, xy)
-        
-        # Delineasi
-        self.grid.catchment(data='dir', x=snapped_xy[0], y=snapped_xy[1], 
-                           dirmap=(64, 128, 1, 2, 4, 8, 16, 32), 
-                           out_name='catch', recursionlimit=15000, xytype='coordinate')
-        
-        # Polygonize
-        self.grid.clip_to('catch')
-        shapes = self.grid.polygonize()
-        
-        # Ambil Polygon terbesar
-        catchment_poly = None
-        max_area = 0
-        for shape, value in shapes:
-            if value == 1: # Value mask catchment
-                poly = Polygon(shape['coordinates'][0])
-                if poly.area > max_area:
-                    max_area = poly.area
-                    catchment_poly = poly
-                    
-        return catchment_poly
-
+        try:
+            snapped_xy = self.grid.snap_to_mask(self.grid.acc > 100, xy)
+            
+            # Delineasi
+            self.grid.catchment(data='dir', x=snapped_xy[0], y=snapped_xy[1], 
+                               dirmap=(64, 128, 1, 2, 4, 8, 16, 32), 
+                               out_name='catch', recursionlimit=15000, xytype='coordinate')
+            
+            # Polygonize (Konversi Raster ke Vektor)
+            self.grid.clip_to('catch')
+            shapes = self.grid.polygonize()
+            
+            # Ambil Polygon terbesar
+            catchment_poly = None
+            max_area = 0
+            for shape, value in shapes:
+                if value == 1: # Value mask catchment
+                    poly = Polygon(shape['coordinates'][0])
+                    if poly.area > max_area:
+                        max_area = poly.area
+                        catchment_poly = poly
+                        
+            return catchment_poly
+        except Exception as e:
+            # Jika gagal snap atau delineasi
+            return None
 # FUNGSI DOWNLOAD DEM (COPERNICUS)
 @st.cache_data
 def fetch_dem_copernicus(bbox):
@@ -406,3 +419,4 @@ elif menu_pilihan == "2. Desain Sipil (Cross/Long)":
 # ==============================================================================
 # END OF CODE
 # ==============================================================================
+
