@@ -1,6 +1,6 @@
 # ==============================================================================
-# SMART PCLP INTEGRATED SYSTEM (HYDRAULIC + CIVIL DESIGN)
-# Gabungan Fitur: Analisis Hidrologi (Lama) + Cross Section/Long Section (Baru)
+# SMART PCLP STUDIO PRO - INTEGRATED VERSION
+# Gabungan Fitur: Analisis Hidrologi (Fix) + Desain Sipil (Cross/Long Section)
 # ==============================================================================
 
 import streamlit as st
@@ -12,11 +12,11 @@ import tempfile
 import math
 import matplotlib.pyplot as plt
 
-# --- LIBRARY HIDROLOGI & GIS ---
+# --- 1. IMPORT LIBRARY GEOSPASIAL & SIPIL ---
+# Menggunakan try-except agar aplikasi tetap jalan meski library kurang (sebagai handling)
 try:
     import geopandas as gpd
     import rasterio
-    from rasterio import MemoryFile
     import rioxarray
     from rioxarray.merge import merge_arrays
     import pystac_client
@@ -24,75 +24,79 @@ try:
     from pysheds.grid import Grid
     import leafmap.foliumap as leafmap
     from streamlit_folium import st_folium
-    from shapely.geometry import Polygon, LineString, Point
+    from shapely.geometry import Polygon, LineString
+    import fiona
 except ImportError as e:
-    st.error(f"Library Geospasial Kurang: {e}. Pastikan requirements.txt lengkap.")
+    st.error(f"⚠️ Error Import Library Geospasial: {e}. Cek requirements.txt Anda.")
 
-# --- LIBRARY TEKNIK SIPIL (DXF) ---
 try:
     import ezdxf
 except ImportError:
-    st.warning("Library ezdxf belum terinstall. Fitur DXF mungkin tidak jalan.")
+    st.warning("⚠️ Library 'ezdxf' belum terinstall. Fitur export CAD tidak akan jalan.")
 
 # KONFIGURASI HALAMAN
-st.set_page_config(page_title="Smart PCLP Studio: Integrated", layout="wide", page_icon="🌊")
+st.set_page_config(page_title="Smart PCLP Studio v7.0", layout="wide", page_icon="🚜")
 
 # ==============================================================================
-# BAGIAN 1: MESIN HIDROLOGI (FITUR LAMA)
+# BAGIAN A: MESIN HIDROLOGI (HYDRO ENGINE - FIXED)
 # ==============================================================================
 
 class HydroEngine:
-    """Mesin untuk memproses DEM dan Delineasi DAS (Fixed Version)"""
+    """
+    Mesin analisis hidrologi menggunakan Pysheds.
+    Diperbaiki agar robust terhadap pembacaan metadata raster.
+    """
     def __init__(self, dem_path):
-        # 1. Inisialisasi Grid dari file (Metadata)
+        # 1. Inisialisasi Grid dari file fisik
+        # Grid.from_raster otomatis membaca koordinat & proyeksi
         self.grid = Grid.from_raster(dem_path)
         
-        # 2. BACA DATA RASTER SECARA EKSPLISIT
-        # Ini langkah yang sebelumnya kurang. Kita harus baca isinya dulu.
+        # 2. Baca data elevasi (isi pixel) secara eksplisit
         dem_data = self.grid.read_raster(dem_path)
         
-        # 3. Masukkan data ke dalam Grid dengan nama 'dem'
-        # Agar fungsi view('dem') nanti bisa menemukannya.
-        self.grid.add_gridded_data(dem_data, data_name='dem', affine=self.grid.affine, crs=self.grid.crs)
+        # 3. Masukkan data ke dalam Grid
+        # FIX: Kita tidak memaksa parameter 'affine'/'crs' manual agar tidak error.
+        # Biarkan grid menggunakan metadata yang sudah dimuat di langkah 1.
+        self.grid.add_gridded_data(dem_data, data_name='dem')
         
-        # 4. Set view (Sekarang aman karena data 'dem' sudah ada)
+        # 4. Set view aktif ke 'dem'
         self.dem = self.grid.view('dem')
 
     def condition_dem(self):
-        # Fill depressions / Pits
-        # Mengisi cekungan agar air bisa mengalir
+        """Memperbaiki DEM (mengisi cekungan/pit filling)"""
+        # Fill depressions
         self.grid.fill_depressions('dem', out_name='flooded_dem')
         self.grid.resolve_flats('flooded_dem', out_name='inflated_dem')
         
-        # Flow Direction & Accumulation
-        # N: North, NE: North-East, etc (D8 Routing)
+        # Flow Direction (D8) & Accumulation
+        # Mapping arah: N, NE, E, SE, S, SW, W, NW
         dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
         self.grid.flowdir(data='inflated_dem', out_name='dir', dirmap=dirmap)
         self.grid.accumulation(data='dir', out_name='acc', dirmap=dirmap)
         return self.grid.view('acc')
 
     def delineate_catchment(self, x, y):
-        # Snap Point ke sungai terdekat (High Accumulation)
+        """Mendelineasi DAS dari titik koordinat (x, y)"""
         xy = (x, y)
-        
-        # Cari titik akumulasi tertinggi di sekitar klik (Radius kecil)
         try:
+            # Snap titik klik ke aliran sungai terdekat (Accumulation > 100)
+            # Ini penting agar tidak delineasi di titik sembarang
             snapped_xy = self.grid.snap_to_mask(self.grid.acc > 100, xy)
             
-            # Delineasi
+            # Hitung Catchment (Daerah Tangkapan)
             self.grid.catchment(data='dir', x=snapped_xy[0], y=snapped_xy[1], 
                                dirmap=(64, 128, 1, 2, 4, 8, 16, 32), 
                                out_name='catch', recursionlimit=15000, xytype='coordinate')
             
-            # Polygonize (Konversi Raster ke Vektor)
+            # Konversi Raster Catchment ke Polygon Vektor
             self.grid.clip_to('catch')
             shapes = self.grid.polygonize()
             
-            # Ambil Polygon terbesar
+            # Cari polygon terbesar (DAS utama)
             catchment_poly = None
             max_area = 0
             for shape, value in shapes:
-                if value == 1: # Value mask catchment
+                if value == 1: # Nilai 1 adalah area catchment
                     poly = Polygon(shape['coordinates'][0])
                     if poly.area > max_area:
                         max_area = poly.area
@@ -100,61 +104,67 @@ class HydroEngine:
                         
             return catchment_poly
         except Exception as e:
-            # Jika gagal snap atau delineasi
+            st.error(f"Gagal Delineasi: {e}")
             return None
-# FUNGSI DOWNLOAD DEM (COPERNICUS)
+
 @st.cache_data
 def fetch_dem_copernicus(bbox):
-    """Download DEM dari Microsoft Planetary Computer"""
-    catalog = pystac_client.Client.open(
-        "https://planetarycomputer.microsoft.com/api/stac/v1",
-        modifier=planetary_computer.sign_inplace
-    )
-    search = catalog.search(
-        collections=["cop-dem-glo-30"],
-        bbox=bbox,
-    )
-    items = list(search.items())
-    if not items: return None
+    """Fungsi Download DEM dari Microsoft Planetary Computer"""
+    try:
+        catalog = pystac_client.Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            modifier=planetary_computer.sign_inplace
+        )
+        search = catalog.search(
+            collections=["cop-dem-glo-30"],
+            bbox=bbox,
+        )
+        items = list(search.items())
+        if not items: return None
 
-    dem_arrays = []
-    for item in items:
-        signed_href = item.assets["data"].href
-        da = rioxarray.open_rasterio(signed_href).rio.clip_box(*bbox)
-        dem_arrays.append(da)
-        
-    if len(dem_arrays) > 1:
-        dem_merged = merge_arrays(dem_arrays)
-        return dem_merged
-    return dem_arrays[0]
+        # Download & Merge
+        dem_arrays = []
+        for item in items:
+            signed_href = item.assets["data"].href
+            # Clip sesuai bbox agar ringan
+            da = rioxarray.open_rasterio(signed_href).rio.clip_box(*bbox)
+            dem_arrays.append(da)
+            
+        if len(dem_arrays) > 1:
+            dem_merged = merge_arrays(dem_arrays)
+            return dem_merged
+        return dem_arrays[0]
+    except Exception as e:
+        st.error(f"Gagal Download DEM: {e}")
+        return None
 
 # ==============================================================================
-# BAGIAN 2: MESIN SIPIL & PCLP (FITUR BARU)
+# BAGIAN B: MESIN SIPIL (PCLP PARSER & DXF)
 # ==============================================================================
 
 def parse_pclp_block(df):
-    """Parser Excel PCLP Cross Section"""
+    """Parser format Excel PCLP Cross Section"""
     parsed_data = []
     i = 0
-    df = df.astype(str)
+    df = df.astype(str) # Pastikan semua string dulu
     
     while i < len(df):
         row = df.iloc[i].values
-        # Cari header X
+        # Cari tanda 'X'
         x_indices = [idx for idx, val in enumerate(row) if str(val).strip().upper() == 'X']
         
         if x_indices and (i + 1 < len(df)):
             x_idx = x_indices[0]
             val_y = str(df.iloc[i+1, x_idx]).strip().upper()
             
-            if val_y == 'Y':
-                # Ambil STA
+            if val_y == 'Y': # Validasi blok PCLP
+                # Ambil Nama STA
                 sta_name = f"STA_{len(parsed_data)}"
                 candidate = str(df.iloc[i+1, 1]).strip()
                 if candidate.lower() not in ['nan', 'none', '']:
                     sta_name = candidate.replace('.0', '')
 
-                # Ambil Data X, Y
+                # Ambil Data Titik
                 start_col = x_idx + 1
                 row_x = df.iloc[i].values
                 row_y = df.iloc[i+1].values
@@ -166,45 +176,57 @@ def parse_pclp_block(df):
                         vy = float(str(row_y[c]).replace(',', '.'))
                         if not (math.isnan(vx) or math.isnan(vy)):
                             points.append((vx, vy))
-                    except: break
+                    except: break # Stop jika ketemu non-angka
                 
                 if points:
-                    points.sort(key=lambda p: p[0])
+                    points.sort(key=lambda p: p[0]) # Sort berdasarkan jarak X
                     parsed_data.append({'STA': sta_name, 'points': points})
                 i += 1
         i += 1
     return parsed_data
 
 def hitung_cut_fill(tanah, desain):
+    """Hitung luas Cut & Fill sederhana dengan Shapely"""
     if not tanah or not desain: return 0.0, 0.0
     try:
+        # Buat datum dummy di bawah tanah terendah
         min_y = min([p[1] for p in tanah] + [p[1] for p in desain])
         datum = min_y - 5.0
+        
+        # Buat Polygon tertutup
         p_tanah = tanah + [(tanah[-1][0], datum), (tanah[0][0], datum)]
         p_desain = desain + [(desain[-1][0], datum), (desain[0][0], datum)]
         
         poly_t = Polygon(p_tanah).buffer(0)
         poly_d = Polygon(p_desain).buffer(0)
         
-        return poly_d.intersection(poly_t).area, poly_d.difference(poly_t).area
+        # Operasi Boolean
+        area_cut = poly_d.intersection(poly_t).area
+        area_fill = poly_d.difference(poly_t).area # Simplifikasi fill
+        
+        return area_cut, area_fill
     except: return 0.0, 0.0
 
 def generate_dxf(results, mode="cross"):
+    """Export hasil ke format DXF AutoCAD"""
     doc = ezdxf.new('R2010')
     msp = doc.modelspace()
-    doc.layers.add(name='TANAH', color=8)
-    doc.layers.add(name='DESAIN', color=1)
-    doc.layers.add(name='TEXT', color=7)
+    
+    # Setup Layer
+    doc.layers.add(name='TANAH', color=8)   # Abu-abu
+    doc.layers.add(name='DESAIN', color=1)  # Merah
+    doc.layers.add(name='TEXT', color=7)    # Putih
 
     if mode == "long":
         tanah, desain = results
         if tanah: msp.add_lwpolyline(tanah, dxfattribs={'layer': 'TANAH'})
         if desain: msp.add_lwpolyline(desain, dxfattribs={'layer': 'DESAIN'})
     else:
+        # Mode Cross Section (Grid Layout)
         for i, item in enumerate(results):
             col = i % 2
             row = i // 2
-            ox, oy = col * 60, row * -40
+            ox, oy = col * 60, row * -40 # Offset antar gambar
             
             t_pts = [(p[0]+ox, p[1]+oy) for p in item.get('points_tanah', [])]
             d_pts = [(p[0]+ox, p[1]+oy) for p in item.get('points_desain', [])]
@@ -220,203 +242,164 @@ def generate_dxf(results, mode="cross"):
     return out.getvalue().encode('utf-8')
 
 # ==============================================================================
-# MAIN APPLICATION INTERFACE (SIDEBAR MENU)
+# BAGIAN C: ANTARMUKA UTAMA (SIDEBAR MENU)
 # ==============================================================================
 
-st.sidebar.title("🎛️ Menu Aplikasi")
-menu_pilihan = st.sidebar.radio("Pilih Modul:", ["1. Analisis Hidrologi (DAS)", "2. Desain Sipil (Cross/Long)"])
+st.sidebar.title("🎛️ Menu Utama")
+pilihan_menu = st.sidebar.radio("Pilih Modul:", ["1. Analisis Hidrologi (DAS)", "2. Desain Sipil (Cross/Long)"])
 
 # ------------------------------------------------------------------------------
-# MODUL 1: ANALISIS HIDROLOGI (Code Lama yang dipulihkan)
+# HALAMAN 1: ANALISIS HIDROLOGI
 # ------------------------------------------------------------------------------
-if menu_pilihan == "1. Analisis Hidrologi (DAS)":
+if pilihan_menu == "1. Analisis Hidrologi (DAS)":
     st.title("💧 Analisis Hidrologi & Delineasi DAS")
-    st.caption("Modul Analisis Topografi, Aliran Sungai, dan Catchment Area")
+    st.info("Upload batas wilayah (KML/GeoJSON) untuk mengunduh DEM dan analisis otomatis.")
 
-    # 1. INPUT WILAYAH (GEOJSON/KML)
-    st.subheader("1. Tentukan Wilayah Studi")
-    up_file = st.file_uploader("Upload Batas Wilayah (GeoJSON/KML/KMZ)", type=["geojson", "kml", "kmz", "json"])
+    # 1. Upload Batas Wilayah
+    up_file = st.file_uploader("Upload Batas Wilayah (GeoJSON/KML)", type=["geojson", "kml", "kmz"])
     
-    bbox = None
     if up_file:
-        # Load File Logic (Simplified)
-        import fiona
+        # Handling KML Driver
         try:
-            # Fix Driver KML
             fiona.drvsupport.supported_drivers['KML'] = 'rw'
             fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
         except: pass
 
+        # Simpan file sementara untuk dibaca Geopandas
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up_file.name.split('.')[-1]}") as tmp:
             tmp.write(up_file.getbuffer())
             tmp_path = tmp.name
 
         try:
-            # Baca Data
+            # Baca File
             gdf = gpd.read_file(tmp_path)
-            # Konversi ke WGS84 untuk Peta
+            # Konversi ke EPSG:4326 (WGS84) Wajib untuk Peta Web
             if gdf.crs != "EPSG:4326":
                 gdf = gdf.to_crs("EPSG:4326")
             
             bbox = gdf.total_bounds # [minx, miny, maxx, maxy]
             st.session_state['bbox'] = bbox
-            st.success(f"Wilayah dimuat: {len(gdf)} fitur.")
+            st.success(f"Wilayah dimuat! Bound: {bbox}")
         except Exception as e:
-            st.error(f"Gagal baca file: {e}")
+            st.error(f"Gagal membaca file vektor: {e}")
 
-    # 2. DOWNLOAD & PROSES DEM
+    # 2. Download DEM
     if 'bbox' in st.session_state:
-        st.subheader("2. Akuisisi Data DEM (Copernicus)")
         if st.button("⬇️ Download & Proses DEM"):
-            with st.spinner("Mengunduh DEM dari Satelit..."):
-                dem_data = fetch_dem_copernicus(st.session_state['bbox'])
+            with st.spinner("Mengunduh DEM... (Mohon tunggu)"):
+                dem_xr = fetch_dem_copernicus(st.session_state['bbox'])
                 
-                if dem_data is not None:
-                    # Simpan DEM ke Tempfile untuk Pysheds (Wajib File Fisik)
+                if dem_xr is not None:
+                    # Simpan sebagai file fisik .tif (WAJIB untuk Pysheds)
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as f_dem:
-                        dem_data.rio.to_raster(f_dem.name)
-                        st.session_state['dem_path'] = f_dem.name
+                        dem_xr.rio.to_raster(f_dem.name)
+                        st.session_state['dem_path'] = f_dem.name # Simpan path file
                     
-                    st.success("DEM berhasil diunduh!")
+                    st.success("DEM Berhasil Diunduh!")
                     
-                    # Proses Hidrologi Awal
-                    eng = HydroEngine(st.session_state['dem_path'])
-                    acc = eng.condition_dem()
-                    st.session_state['hydro_engine'] = eng # Simpan Objek Engine
-                    st.success("Analisis Arah Aliran Selesai!")
+                    # Inisialisasi Hydro Engine
+                    try:
+                        eng = HydroEngine(st.session_state['dem_path'])
+                        eng.condition_dem() # Proses Flow Direction
+                        st.session_state['hydro_engine'] = eng
+                        st.success("Analisis Arah Aliran Selesai!")
+                    except Exception as e:
+                        st.error(f"Error Hydro Engine: {e}")
 
-    # 3. INTERAKTIF PETA & DELINEASI
-    st.subheader("3. Peta Interaktif & Delineasi")
-    
+    # 3. Peta Interaktif
     if 'dem_path' in st.session_state:
+        st.subheader("Peta & Delineasi")
+        st.caption("Klik pada area lembah/sungai di peta untuk membuat DAS.")
+        
         m = leafmap.Map()
+        m.add_raster(st.session_state['dem_path'], layer_name="DEM", colormap="terrain")
         
-        # Tambahkan DEM ke Peta
-        m.add_raster(st.session_state['dem_path'], layer_name="DEM Topografi", colormap="terrain")
-        
-        # Tambahkan Sungai (Thresholding Accumulation)
-        # Note: Ini visualisasi kasar sungai
-        # (Idealnya konversi raster stream ke vector dulu, tapi untuk cepat kita pakai raster)
-        
-        st.write("klik pada peta di area sungai (lembah) untuk delineasi DAS.")
-        
-        # Render Peta dengan Folium
+        # Tampilkan Peta
         map_out = st_folium(m, height=500, width=None)
         
-        # Logika Klik untuk Delineasi
-        if map_out['last_clicked']:
+        # Logika Klik Delineasi
+        if map_out and map_out['last_clicked']:
             lat = map_out['last_clicked']['lat']
             lng = map_out['last_clicked']['lng']
-            st.info(f"Titik Outlet Dipilih: {lat}, {lng}")
+            st.info(f"Koordinat Klik: {lat}, {lng}")
             
             if 'hydro_engine' in st.session_state:
-                with st.spinner("Menghitung Batas DAS (Delineasi)..."):
+                with st.spinner("Menghitung Batas DAS..."):
                     eng = st.session_state['hydro_engine']
                     poly_das = eng.delineate_catchment(lng, lat)
                     
                     if poly_das:
-                        st.success(f"DAS Terhitung! Luas: {poly_das.area:.6f} deg²")
-                        # Konversi ke GeoDataFrame untuk Download
-                        gdf_das = gpd.GeoDataFrame(index=[0], crs="EPSG:4326", geometry=[poly_das])
+                        st.success(f"DAS Terbentuk! Luas: {poly_das.area:.6f} deg²")
                         
-                        # Download Button
-                        json_das = gdf_das.to_json()
-                        st.download_button("📥 Download GeoJSON DAS", json_das, "batas_das.geojson", "application/json")
+                        # Siapkan Download
+                        gdf_res = gpd.GeoDataFrame(index=[0], crs="EPSG:4326", geometry=[poly_das])
+                        st.download_button("📥 Download GeoJSON DAS", gdf_res.to_json(), "das_result.geojson")
                     else:
-                        st.warning("Gagal mendelineasi. Coba klik lebih dekat ke alur sungai.")
+                        st.warning("Gagal delineasi. Coba klik lebih pas di alur sungai.")
 
 # ------------------------------------------------------------------------------
-# MODUL 2: DESAIN SIPIL (Fitur PCLP Baru)
+# HALAMAN 2: DESAIN SIPIL
 # ------------------------------------------------------------------------------
-elif menu_pilihan == "2. Desain Sipil (Cross/Long)":
-    st.title("🚜 PCLP Desain Sipil")
-    st.caption("Modul Cross Section, Long Section, dan Volume Cut/Fill")
+elif pilihan_menu == "2. Desain Sipil (Cross/Long)":
+    st.title("🚜 Desain Sipil & PCLP")
     
-    tab_cross, tab_long = st.tabs(["📐 Cross Section", "📈 Long Section"])
+    tab1, tab2 = st.tabs(["📐 Cross Section", "📈 Long Section"])
     
-    # --- SUB-TAB CROSS SECTION ---
-    with tab_cross:
-        st.write("### Input Data Cross Section")
-        f_up = st.file_uploader("Upload Excel PCLP (.xlsx)", type=['xlsx', 'xls'])
-        
-        if f_up:
-            xls = pd.ExcelFile(f_up)
+    with tab1:
+        st.subheader("Cross Section")
+        f_pclp = st.file_uploader("Upload Excel PCLP (.xlsx)", type=['xlsx'])
+        if f_pclp:
+            xls = pd.ExcelFile(f_pclp)
             s_ogl = st.selectbox("Sheet Tanah", xls.sheet_names, index=0)
             s_dsn = st.selectbox("Sheet Desain", xls.sheet_names, index=1 if len(xls.sheet_names)>1 else 0)
             
-            if st.button("Proses Cross Section"):
-                df_ogl = pd.read_excel(f_up, sheet_name=s_ogl, header=None)
-                df_dsn = pd.read_excel(f_up, sheet_name=s_dsn, header=None)
+            if st.button("Proses Data"):
+                d_ogl = parse_pclp_block(pd.read_excel(f_pclp, sheet_name=s_ogl, header=None))
+                d_dsn = parse_pclp_block(pd.read_excel(f_pclp, sheet_name=s_dsn, header=None))
                 
-                d_ogl = parse_pclp_block(df_ogl)
-                d_dsn = parse_pclp_block(df_dsn)
-                
-                # Gabung & Hitung
+                # Gabung
                 final = []
                 for i in range(max(len(d_ogl), len(d_dsn))):
                     t = d_ogl[i] if i < len(d_ogl) else None
                     d = d_dsn[i] if i < len(d_dsn) else None
                     sta = t['STA'] if t else (d['STA'] if d else f"STA_{i}")
-                    
-                    tp = t['points'] if t else []
-                    dp = d['points'] if d else []
+                    tp, dp = (t['points'] if t else []), (d['points'] if d else [])
                     c, f = hitung_cut_fill(tp, dp)
-                    
                     final.append({'STA': sta, 'points_tanah': tp, 'points_desain': dp, 'cut': c, 'fill': f})
                 
-                st.session_state['cross_data'] = final
-                st.success("Selesai Hitung!")
+                st.session_state['cross_res'] = final
+                st.success("Selesai!")
         
-        if 'cross_data' in st.session_state:
-            data = st.session_state['cross_data']
-            idx = st.slider("Pilih STA", 0, len(data)-1, 0)
-            item = data[idx]
+        if 'cross_res' in st.session_state:
+            res = st.session_state['cross_res']
+            idx = st.slider("Pilih STA", 0, len(res)-1, 0)
+            item = res[idx]
             
-            fig, ax = plt.subplots(figsize=(10, 3))
+            fig, ax = plt.subplots(figsize=(10,3))
             if item['points_tanah']: ax.plot(*zip(*item['points_tanah']), 'k-o', label='Tanah')
             if item['points_desain']: ax.plot(*zip(*item['points_desain']), 'r-', label='Desain')
-            ax.set_title(f"{item['STA']} (Cut: {item['cut']:.2f}, Fill: {item['fill']:.2f})")
+            ax.set_title(f"{item['STA']} | C: {item['cut']:.2f}, F: {item['fill']:.2f}")
             ax.legend()
             ax.grid(True)
             st.pyplot(fig)
             
-            dxf = generate_dxf(data, "cross")
-            st.download_button("📥 Download DXF Cross", dxf, "cross_section.dxf")
-
-    # --- SUB-TAB LONG SECTION ---
-    with tab_long:
-        st.write("### Input Long Section")
-        f_long = st.file_uploader("Upload Data Long (.csv/.xlsx)", type=['csv','xlsx'])
+            dxf_btn = generate_dxf(res, "cross")
+            st.download_button("📥 Download DXF", dxf_btn, "cross_section.dxf")
+            
+    with tab2:
+        st.subheader("Long Section")
+        f_long = st.file_uploader("Upload Long Section (.csv)", type=['csv'])
         if f_long:
-            # Simple Reader Logic
-            try:
-                if f_long.name.endswith('.csv'):
-                    df = pd.read_csv(f_long)
-                else:
-                    df = pd.read_excel(f_long)
-                
-                # Asumsi 2 kolom pertama: Jarak, Elevasi
-                pts = df.iloc[:, :2].dropna().values.tolist()
-                pts.sort(key=lambda x: x[0])
-                
-                st.session_state['long_pts'] = pts
-                st.success("Data Long Section Terbaca!")
-            except:
-                st.error("Format file tidak sesuai.")
-                
+            df = pd.read_csv(f_long)
+            # Asumsi 2 kolom pertama
+            pts = df.iloc[:, :2].dropna().values.tolist()
+            st.session_state['long_pts'] = pts
+            
         if 'long_pts' in st.session_state:
             pts = st.session_state['long_pts']
-            fig, ax = plt.subplots(figsize=(10, 4))
+            fig, ax = plt.subplots(figsize=(10,4))
             ax.plot(*zip(*pts), 'b-')
-            ax.set_title("Long Section Profile")
-            ax.grid(True)
             st.pyplot(fig)
             
-            # DXF
             dxf_long = generate_dxf((pts, []), "long")
             st.download_button("📥 Download DXF Long", dxf_long, "long_section.dxf")
-
-# ==============================================================================
-# END OF CODE
-# ==============================================================================
-
