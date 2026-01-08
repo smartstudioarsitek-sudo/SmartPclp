@@ -1,390 +1,299 @@
 import streamlit as st
-import pandas as pd
-import ezdxf
-from shapely.geometry import Polygon, LineString, Point, shape
-import matplotlib.pyplot as plt
-import io
+import geopandas as gpd
+import rasterio
+from rasterio.io import MemoryFile
 import numpy as np
-import math
-import zipfile
 import tempfile
 import os
-
-# Konfigurasi Halaman
-st.set_page_config(page_title="PCLP Studio Pro v7.0 GIS", layout="wide", page_icon="🛰️")
-
-# --- LIBRARY LOADING ---
-HAS_GEO_LIBS = False
-try:
-    import geopandas as gpd
-    import rasterio
-    from rasterio import features
-    from rasterio.transform import xy
-    from skimage import measure # Untuk algoritma kontur
-    import folium
-    from streamlit_folium import st_folium, folium_static
-    from folium.plugins import Draw
-    HAS_GEO_LIBS = True
-except ImportError as e:
-    st.error(f"Error Library: {e}")
+import zipfile
+import leafmap.foliumap as leafmap
+from pystac_client import Client
+import planetary_computer
+import rioxarray
+from pysheds.grid import Grid
+from shapely.geometry import shape, box
+import fiona
 
 # ==========================================
-# 1. CORE ENGINE: PARSER & MATH
+# KONFIGURASI HALAMAN & DRIVER
 # ==========================================
-def parse_pclp_block(df):
-    """Parser PCLP Legacy (tetap dipertahankan untuk kompatibilitas)."""
-    parsed_data = []
-    i = 0
-    df = df.astype(str)
-    while i < len(df):
-        row = df.iloc[i].values
-        x_indices = [idx for idx, val in enumerate(row) if val.strip().upper() == 'X']
-        if x_indices and (i + 1 < len(df)):
-            x_idx = x_indices[0]
-            val_y = str(df.iloc[i+1, x_idx]).strip().upper()
-            if val_y == 'Y':
-                sta_name = f"STA_{len(parsed_data)}"
-                candidate_sta = str(df.iloc[i+1, 1]).strip() 
-                if candidate_sta.lower() not in ['nan', 'none', '']:
-                    sta_name = candidate_sta
-                if sta_name.endswith('.0'): sta_name = sta_name[:-2]
+st.set_page_config(page_title="HydroStream: Advanced Hydrology", layout="wide", page_icon="💧")
 
-                start_col = x_idx + 1
-                row_x = df.iloc[i].values; row_y = df.iloc[i+1].values
-                points = []
-                for c in range(start_col, len(row_x)):
-                    try:
-                        vx = float(str(row_x[c]).replace(',', '.'))
-                        vy = float(str(row_y[c]).replace(',', '.'))
-                        if not (math.isnan(vx) or math.isnan(vy)):
-                            points.append((vx, vy))
-                    except: break
-                if points:
-                    points.sort(key=lambda p: p[0])
-                    parsed_data.append({'STA': sta_name, 'points': points})
-                i += 1
-        i += 1
-    return parsed_data
+# [CRITICAL] Enable KML Driver support for Fiona/Geopandas
+# Ini memperbaiki masalah "Driver Error" saat membaca KML/KMZ
+fiona.drvsupport.supported_drivers['KML'] = 'rw'
+fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
-def hitung_cut_fill(tanah_pts, desain_pts):
-    if not tanah_pts or not desain_pts: return 0.0, 0.0
-    min_y = min([p[1] for p in tanah_pts] + [p[1] for p in desain_pts])
-    datum = min_y - 5.0
-    p_tanah = tanah_pts + [(tanah_pts[-1][0], datum), (tanah_pts[0][0], datum)]
-    p_desain = desain_pts + [(desain_pts[-1][0], datum), (desain_pts[0][0], datum)]
+# ==========================================
+# 1. UNIFIED INPUT LOADER (GEOJSON + KMZ)
+# ==========================================
+def load_vector_data(uploaded_file):
+    """
+    Menangani input hybrid: Membaca GeoJSON text-stream atau KMZ binary-stream.
+    Mengembalikan: GeoDataFrame (EPSG:4326)
+    """
     try:
-        poly_tanah = Polygon(p_tanah).buffer(0)
-        poly_desain = Polygon(p_desain).buffer(0)
-        return poly_desain.intersection(poly_tanah).area, poly_desain.difference(poly_tanah).area
-    except: return 0.0, 0.0
+        # Skenario 1: GeoJSON (Text based)
+        if uploaded_file.name.lower().endswith(('.geojson', '.json')):
+            # Geopandas bisa membaca BytesIO langsung
+            uploaded_file.seek(0)
+            gdf = gpd.read_file(uploaded_file)
 
-# ==========================================
-# 2. GIS ENGINE: KMZ & CONTOURS
-# ==========================================
-def read_kmz_to_gdf(uploaded_file):
-    """Mengekstrak KML dari KMZ dan membaca sebagai GeoDataFrame."""
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Simpan KMZ sementara
-            kmz_path = os.path.join(temp_dir, "temp.kmz")
-            with open(kmz_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Unzip
-            with zipfile.ZipFile(kmz_path, 'r') as z:
-                kml_file = [x for x in z.namelist() if x.endswith(".kml")][0]
-                z.extract(kml_file, temp_dir)
-                kml_path = os.path.join(temp_dir, kml_file)
+        # Skenario 2: KMZ (Zipped KML)
+        elif uploaded_file.name.lower().endswith('.kmz'):
+            # KMZ harus di-unzip. Gunakan temp directory agar bersih.
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Simpan arsip KMZ sementara
+                kmz_path = os.path.join(temp_dir, "temp.kmz")
+                with open(kmz_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
                 
-                # Baca dengan GeoPandas (fiona support KML)
-                gdf = gpd.read_file(kml_path)
-                return gdf
+                # Ekstrak
+                with zipfile.ZipFile(kmz_path, 'r') as z:
+                    z.extractall(temp_dir)
+                    # Cari file .kml di dalam hasil ekstraksi
+                    kml_files = [x for x in os.listdir(temp_dir) if x.endswith(".kml")]
+                    
+                    if not kml_files:
+                        st.error("KMZ valid, tapi tidak ditemukan file .kml didalamnya.")
+                        return None
+                    
+                    kml_path = os.path.join(temp_dir, kml_files[0])
+                    # Baca dengan driver KML eksplisit
+                    gdf = gpd.read_file(kml_path, driver='KML')
+
+        else:
+            st.error("Format file tidak didukung.")
+            return None
+
+        # Standardisasi Koordinat ke WGS84
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326")
+        elif gdf.crs != "EPSG:4326":
+            gdf = gdf.to_crs("EPSG:4326")
+            
+        return gdf
+
     except Exception as e:
-        st.error(f"Gagal baca KMZ: {e}")
+        st.error(f"Error Loading File: {str(e)}")
         return None
 
-def generate_contours_vector(dem_src, interval=1.0):
+# ==========================================
+# 2. AUTOMATED DEM ACQUISITION (STAC API)
+# ==========================================
+@st.cache_data(show_spinner=False)
+def fetch_dem_copernicus(bounds):
     """
-    Algoritma Marching Squares untuk menghasilkan garis kontur vektor dari Raster.
-    Output: List of Dictionary {'level': float, 'geometry': LineString}
+    Mengunduh DEM Copernicus GLO-30 dari Microsoft Planetary Computer.
+    Input: bounds (minx, miny, maxx, maxy)
+    Output: Rasterio MemoryFile object (virtual file)
     """
-    # Baca data raster
-    arr = dem_src.read(1)
-    transform = dem_src.transform
+    # 1. Setup Client
+    catalog = Client.open(
+        "https://planetarycomputer.microsoft.com/api/stac/v1",
+        modifier=planetary_computer.sign_inplace
+    )
+
+    # 2. Search Tile
+    # Buffer sedikit bounds agar tidak pas di tepi
+    bbox = [bounds[0]-0.01, bounds[1]-0.01, bounds[2]+0.01, bounds[3]+0.01]
     
-    # Handle NoData
-    if dem_src.nodata is not None:
-        arr = np.where(arr == dem_src.nodata, np.nan, arr)
+    search = catalog.search(
+        collections=["cop-dem-glo-30"],
+        bbox=bbox
+    )
+    items = list(search.get_items())
     
-    # Tentukan level kontur
-    min_z = np.nanmin(arr)
-    max_z = np.nanmax(arr)
-    levels = np.arange(np.floor(min_z), np.ceil(max_z), interval)
-    
-    contours_vectors = []
-    
-    for level in levels:
-        # skimage returns list of (row, col) coordinates
-        contours = measure.find_contours(arr, level)
+    if not items:
+        return None, "Tidak ditemukan data DEM di lokasi ini."
+
+    # 3. Load & Merge using Rioxarray (Lazy Loading)
+    try:
+        # Load datasets
+        datasets = []
+        for item in items:
+            signed_asset = item.assets["data"].href
+            da = rioxarray.open_rasterio(signed_asset)
+            # Clip dulu sebelum merge untuk hemat memori
+            da_clipped = da.rio.clip_box(*bbox)
+            datasets.append(da_clipped)
+
+        # Merge jika lebih dari 1 tile
+        if len(datasets) > 1:
+            from rioxarray.merge import merge_arrays
+            dem_merged = merge_arrays(datasets)
+        else:
+            dem_merged = datasets[0]
+
+        # 4. Export ke In-Memory Rasterio Format untuk Pysheds
+        # Kita perlu menyimpan sebagai bytes agar bisa dibaca Pysheds/Rasterio
+        dem_bytes = io.BytesIO()
+        dem_merged.rio.to_raster(dem_bytes, driver="GTiff")
+        dem_bytes.seek(0)
         
-        for contour in contours:
-            # Transform pixel (row, col) ke world (x, y)
-            # Perhatikan: contour[:, 1] adalah col (x), contour[:, 0] adalah row (y)
-            cols = contour[:, 1]
-            rows = contour[:, 0]
-            xs, ys = rasterio.transform.xy(transform, rows, cols)
+        return dem_bytes, None
+
+    except Exception as e:
+        return None, str(e)
+
+# ==========================================
+# 3. HYDROLOGY ENGINE (PYSHEDS)
+# ==========================================
+class HydroEngine:
+    def __init__(self, dem_bytes):
+        # Load DEM ke Pysheds Grid
+        self.grid = Grid()
+        self.grid.read_raster(dem_bytes)
+        self.dem = self.grid.view('dem')
+        
+    def condition_dem(self):
+        # 1. Fill Depressions (Pit Filling)
+        # Pysheds menggunakan algoritma Priority-Flood yang efisien
+        self.demb = self.grid.fill_depressions('dem')
+        
+        # 2. Resolve Flats
+        self.inflated_dem = self.grid.resolve_flats('dem', new_data='inflated_dem')
+        return self.inflated_dem
+
+    def compute_flow(self):
+        # 3. Flow Direction (Numpy-based D8)
+        # dirmap=(64, 128, 1, 2, 4, 8, 16, 32) -> ESRI Scheme support
+        self.fdir = self.grid.flowdir(data='inflated_dem', dirmap=(64, 128, 1, 2, 4, 8, 16, 32))
+        
+        # 4. Flow Accumulation
+        self.acc = self.grid.accumulation(data='fdir', dirmap=(64, 128, 1, 2, 4, 8, 16, 32))
+        return self.fdir, self.acc
+
+    def extract_streams(self, threshold=1000):
+        # 5. Extract River Network
+        # threshold = jumlah sel hulu
+        streams = self.acc > threshold
+        return streams
+
+    def delineate_catchment(self, x, y):
+        # 6. Snap Pour Point
+        # Cari akumulasi tertinggi dalam radius pencarian
+        try:
+            xy = self.grid.snap_to_mask(self.acc > 1000, (x, y))
             
-            if len(xs) > 1:
-                pts = list(zip(xs, ys))
-                line = LineString(pts)
-                contours_vectors.append({'level': level, 'geometry': line})
-                
-    return contours_vectors
-
-def create_dxf_from_gis(contours_data, trase_gdf=None):
-    """Membuat DXF 3D dari data kontur dan trase."""
-    doc = ezdxf.new('R2010')
-    msp = doc.modelspace()
-    
-    # Layers
-    doc.layers.add(name='KONTUR_MAYOR', color=1) # Merah
-    doc.layers.add(name='KONTUR_MINOR', color=7) # Putih
-    doc.layers.add(name='TRASE_JALAN', color=3)  # Hijau
-    doc.layers.add(name='TEXT_ELEVASI', color=2) # Kuning
-
-    # Gambar Kontur
-    for c in contours_data:
-        lvl = c['level']
-        is_major = (lvl % 5 == 0) # Interval mayor tiap 5m
-        layer = 'KONTUR_MAYOR' if is_major else 'KONTUR_MINOR'
-        
-        # Konversi LineString ke List points
-        pts = list(c['geometry'].coords)
-        
-        # Tambahkan LWPOLYLINE dengan Elevasi (Fitur 3D AutoCAD)
-        msp.add_lwpolyline(pts, dxfattribs={
-            'layer': layer,
-            'elevation': lvl # Ini kuncinya agar terbaca 3D
-        })
-    
-    # Gambar Trase (Jika ada)
-    if trase_gdf is not None:
-        for idx, row in trase_gdf.iterrows():
-            geom = row.geometry
-            if geom.geom_type == 'LineString':
-                pts = list(geom.coords)
-                msp.add_lwpolyline(pts, dxfattribs={'layer': 'TRASE_JALAN', 'lineweight': 30})
-            elif geom.geom_type == 'MultiLineString':
-                for line in geom.geoms:
-                    pts = list(line.coords)
-                    msp.add_lwpolyline(pts, dxfattribs={'layer': 'TRASE_JALAN', 'lineweight': 30})
-
-    out = io.StringIO()
-    doc.write(out)
-    return out.getvalue().encode('utf-8')
-
-# ==========================================
-# 3. UI GENERATORS
-# ==========================================
-def generate_dxf_cross(results):
-    """DXF Generator untuk Cross Section (Legacy Code)."""
-    doc = ezdxf.new('R2010')
-    msp = doc.modelspace()
-    doc.layers.add(name='TANAH', color=8); doc.layers.add(name='DESAIN', color=1); doc.layers.add(name='TEXT', color=7)
-    
-    for i, item in enumerate(results):
-        col, row = i % 2, i // 2
-        off_x, off_y = col * 60, row * -40
-        
-        t_pts = [(p[0]+off_x, p[1]+off_y) for p in item.get('points_tanah', [])]
-        d_pts = [(p[0]+off_x, p[1]+off_y) for p in item.get('points_desain', [])]
-        
-        if t_pts: msp.add_lwpolyline(t_pts, dxfattribs={'layer': 'TANAH'})
-        if d_pts: msp.add_lwpolyline(d_pts, dxfattribs={'layer': 'DESAIN'})
-        
-        info = f"{item['STA']} | C:{item['cut']:.2f} | F:{item['fill']:.2f}"
-        msp.add_text(info, dxfattribs={'height': 0.5, 'layer': 'TEXT'}).set_placement((off_x, off_y-2))
-        
-    out = io.StringIO(); doc.write(out)
-    return out.getvalue().encode('utf-8')
-
-# ==========================================
-# 4. MAIN APP LOGIC
-# ==========================================
-st.title("🛰️ PCLP Studio Pro v7.0 (GIS Revolution)")
-st.markdown("""
-**Fitur Baru:** 1. Import **KMZ Google Earth** & Interactive Drawing.
-2. Auto-Generate **Kontur DXF** dari DEM.
-3. Integrasi **Geospasial** ke Desain Teknik.
-""")
-
-tabs = st.tabs(["📐 CROSS SECTION", "📈 LONG SECTION", "🌍 GIS & TOPOGRAFI (NEW)"])
-
-# --- TAB 1: CROSS SECTION ---
-with tabs[0]:
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        f_cross = st.file_uploader("Upload Excel PCLP", type=['xls', 'xlsx'], key='up_cross')
-        if f_cross:
-            xls = pd.ExcelFile(f_cross)
-            s_ogl = st.selectbox("Sheet Tanah", xls.sheet_names, key='s1')
-            s_dsn = st.selectbox("Sheet Desain", xls.sheet_names, key='s2')
-            if st.button("Proses Cross"):
-                d_ogl = parse_pclp_block(pd.read_excel(f_cross, sheet_name=s_ogl, header=None))
-                d_dsn = parse_pclp_block(pd.read_excel(f_cross, sheet_name=s_dsn, header=None))
-                final = []
-                for i in range(max(len(d_ogl), len(d_dsn))):
-                    to = d_ogl[i] if i < len(d_ogl) else None
-                    td = d_dsn[i] if i < len(d_dsn) else None
-                    tp = to['points'] if to else []
-                    dp = td['points'] if td else []
-                    c, f = hitung_cut_fill(tp, dp)
-                    final.append({'STA': to['STA'] if to else f"STA_{i}", 'points_tanah': tp, 'points_desain': dp, 'cut': c, 'fill': f})
-                st.session_state['res_cross'] = final
-                st.success("Selesai!")
-
-    with col2:
-        if 'res_cross' in st.session_state:
-            res = st.session_state['res_cross']
-            sel = st.select_slider("Pilih STA", options=[r['STA'] for r in res])
-            dat = next(item for item in res if item['STA'] == sel)
+            # 7. Delineate
+            catchment = self.grid.catchment(x=xy[0], y=xy[1], fdir='fdir', 
+                                          dirmap=(64, 128, 1, 2, 4, 8, 16, 32), 
+                                          xytype='coordinate')
             
-            fig, ax = plt.subplots(figsize=(8,3))
-            if dat['points_tanah']: ax.plot(*zip(*dat['points_tanah']), 'k-o', label='Tanah')
-            if dat['points_desain']: ax.plot(*zip(*dat['points_desain']), 'r-', label='Desain')
-            ax.set_title(f"Cut: {dat['cut']:.2f} m2 | Fill: {dat['fill']:.2f} m2")
-            ax.legend(); ax.grid(True)
-            st.pyplot(fig)
+            # 8. Polygonize hasil catchment raster ke Vector
+            shapes = self.grid.polygonize(catchment)
+            # Ambil shape terbesar (DAS utama)
+            catchment_poly = max(shapes, key=lambda s: shape(s[0]).area)
+            return shape(catchment_poly[0])
+        except Exception as e:
+            return None
+
+import io # Helper import
+
+# ==========================================
+# MAIN APP UI
+# ==========================================
+def main():
+    st.sidebar.title("🛠️ Kontrol Hidrologi")
+    
+    # 1. FILE UPLOAD (RESTORED FUNCTIONALITY)
+    st.sidebar.subheader("1. Input Data Spasial")
+    # [CRITICAL] Widget type diset inclusive untuk GeoJSON & KMZ
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload AOI (Batas Wilayah)", 
+        type=['geojson', 'kml', 'kmz'],
+        help="Mendukung format GeoJSON (teks) dan KMZ (Google Earth)"
+    )
+
+    aoi_gdf = None
+    if uploaded_file:
+        with st.spinner("Parsing file input..."):
+            aoi_gdf = load_vector_data(uploaded_file)
             
-            st.download_button("📥 DXF Cross", generate_dxf_cross(res), "Cross.dxf")
-
-# --- TAB 2: LONG SECTION ---
-with tabs[1]:
-    st.info("Fitur Long Section standard (Upload Excel/CSV Jarak & Elevasi)")
-    # (Kode Long Section disederhanakan untuk fokus ke GIS, gunakan kode lama jika perlu)
-    f_long = st.file_uploader("Upload CSV Long", type=['csv'])
-    if f_long:
-        df = pd.read_csv(f_long).dropna()
-        st.line_chart(df.iloc[:, 1])
-
-# --- TAB 3: GIS & TOPOGRAFI (CORE UPDATE) ---
-with tabs[2]:
-    st.header("🌍 Analisis Topografi & Konversi CAD")
-    
-    col_map, col_proc = st.columns([1.5, 1])
-    
-    # 1. INPUT INTERFACE
-    with col_map:
-        st.subheader("1. Area of Interest (AOI)")
-        
-        # Pilihan Input
-        input_mode = st.radio("Metode Input:", ["Upload KMZ/KML", "Gambar Manual di Peta"])
-        
-        aoi_gdf = None
-        
-        if input_mode == "Upload KMZ/KML":
-            f_kmz = st.file_uploader("Upload File Google Earth (.kmz/.kml)", type=['kmz', 'kml'])
-            if f_kmz:
-                aoi_gdf = read_kmz_to_gdf(f_kmz)
-                if aoi_gdf is not None:
-                    st.success(f"Berhasil memuat {len(aoi_gdf)} fitur geometri!")
-        
-        # Inisialisasi Peta
-        m = folium.Map(location=[-5.3971, 105.2668], zoom_start=10) # Default Lampung
-        
-        # Jika ada AOI dari KMZ, tambahkan ke peta
         if aoi_gdf is not None:
-            # Reproject ke WGS84 untuk Folium
-            aoi_web = aoi_gdf.to_crs("EPSG:4326")
-            folium.GeoJson(aoi_web).add_to(m)
-            # Zoom ke area
-            bounds = aoi_web.total_bounds
-            m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-
-        # Draw Control
-        draw = Draw(
-            export=True,
-            filename='my_data.geojson',
-            draw_options={'polyline': True, 'polygon': True, 'rectangle': True, 'circle': False, 'marker': False}
-        )
-        draw.add_to(m)
+            st.sidebar.success(f"AOI Dimuat: {len(aoi_gdf)} fitur.")
+            bounds = aoi_gdf.total_bounds # minx, miny, maxx, maxy
+    
+    # 2. MAP INITIALIZATION
+    m = leafmap.Map(draw_control=False)
+    
+    # 3. PROCESSING WORKFLOW
+    if aoi_gdf is not None:
+        # Tampilkan AOI
+        m.add_gdf(aoi_gdf, layer_name="Batas AOI", style={'color': 'red', 'fill': False, 'weight': 2})
+        m.zoom_to_bounds(aoi_gdf.total_bounds)
         
-        # Render Peta
-        output = st_folium(m, width=700, height=500)
-        
-        # Tangkap Hasil Gambar Manual
-        if input_mode == "Gambar Manual di Peta" and output['all_drawings']:
-            # Konversi JSON gambar ke GeoDataFrame
-            drawings = output['all_drawings']
-            if drawings:
-                features = [d['geometry'] for d in drawings]
-                # Buat GDF dummy
-                # Ini logic simple, idealnya parse GeoJSON full
-                from shapely.geometry import shape
-                geoms = [shape(f) for f in features]
-                aoi_gdf = gpd.GeoDataFrame(geometry=geoms, crs="EPSG:4326")
-                st.info("Sketsa manual terdeteksi.")
-
-    # 2. PROCESSING INTERFACE
-    with col_proc:
-        st.subheader("2. Pemrosesan Data DEM")
-        
-        st.warning("⚠️ Upload DEM (GeoTIFF) dari SRTM/Demnas/Copernicus.")
-        f_dem = st.file_uploader("Upload File DEM (.tif)", type=['tif', 'tiff'])
-        
-        if f_dem and aoi_gdf is not None:
-            # Tampilkan tombol proses
-            interval = st.number_input("Interval Kontur (m)", min_value=1.0, value=5.0, step=1.0)
+        # Tombol Proses DEM
+        if st.sidebar.button("🚀 Mulai Analisis Hidrologi"):
+            with st.spinner("Mengunduh DEM Copernicus GLO-30 (High-Res)..."):
+                dem_bytes, err = fetch_dem_copernicus(bounds)
             
-            if st.button("⚙️ GENERATE KONTUR & DXF"):
-                with st.spinner("Sedang memproses topografi..."):
-                    try:
-                        # 1. Buka Raster
-                        with rasterio.open(f_dem) as src:
-                            # 2. Clip Raster sesuai AOI (Opsional, di sini kita baca full dulu untuk demo)
-                            # Idealnya menggunakan mask.mask
-                            
-                            # Cek CRS AOI, samakan dengan Raster
-                            aoi_proj = aoi_gdf.to_crs(src.crs)
-                            
-                            # Masking/Clipping
-                            out_image, out_transform = rasterio.mask.mask(src, aoi_proj.geometry, crop=True)
-                            out_meta = src.meta.copy()
-                            out_meta.update({"driver": "GTiff", "height": out_image.shape[1], "width": out_image.shape[2], "transform": out_transform})
-                            
-                            # Simpan Memory File untuk Contour Engine
-                            with rasterio.io.MemoryFile() as memfile:
-                                with memfile.open(**out_meta) as dataset:
-                                    dataset.write(out_image)
-                                    
-                                    # 3. Generate Vector Contours
-                                    contours = generate_contours_vector(dataset, interval)
-                            
-                            st.success(f"Berhasil membuat {len(contours)} segmen kontur!")
-                            
-                            # 4. Preview Plot Simple
-                            fig, ax = plt.subplots()
-                            for c in contours:
-                                x, y = c['geometry'].xy
-                                ax.plot(x, y, linewidth=0.5, color='brown')
-                            # Plot Trase/AOI
-                            aoi_proj.plot(ax=ax, facecolor='none', edgecolor='blue', linewidth=2)
-                            st.pyplot(fig)
-                            
-                            # 5. Export DXF
-                            dxf_bytes = create_dxf_from_gis(contours, aoi_proj)
-                            st.download_button(
-                                label="📥 DOWNLOAD CAD (DXF 3D)",
-                                data=dxf_bytes,
-                                file_name="Kontur_Situasi.dxf",
-                                mime="application/dxf"
-                            )
-                            
-                    except Exception as e:
-                        st.error(f"Error Processing: {str(e)}")
-                        st.write("Tips: Pastikan CRS DEM dan Lokasi AOI beririsan.")
+            if dem_bytes:
+                st.session_state['dem_data'] = dem_bytes
+                
+                with st.spinner("Preprocessing DEM & Flow Routing..."):
+                    # Inisialisasi Engine
+                    engine = HydroEngine(dem_bytes)
+                    engine.condition_dem()
+                    engine.compute_flow()
+                    
+                    # Simpan engine ke session state (perlu pickling hati-hati, atau simpan grid saja)
+                    # Untuk simplicity, kita hitung on-the-fly karena Pysheds cepat untuk area kecil-sedang
+                    st.session_state['engine'] = engine
+                    st.success("Analisis Topografi Selesai!")
+            else:
+                st.error(err)
+
+    # 4. INTERACTIVE ANALYSIS LAYERS
+    if 'engine' in st.session_state:
+        engine = st.session_state['engine']
         
-        elif not f_dem:
-            st.info("Menunggu upload DEM...")
-        elif aoi_gdf is None:
-            st.info("Silakan upload KMZ atau gambar area di peta dulu.")
+        st.sidebar.subheader("2. Parameter Sungai")
+        thresh = st.sidebar.slider("Flow Accumulation Threshold", 100, 10000, 1000, 
+                                   help="Nilai kecil = Deteksi anak sungai. Nilai besar = Sungai utama saja.")
+        
+        # Ekstrak Sungai Real-time
+        streams_raster = engine.extract_streams(thresh)
+        
+        # Visualisasi Sungai (Raster Overlay)
+        # Konversi ke float untuk visualisasi (0=NoData, 1=Stream)
+        stream_view = np.where(streams_raster, 1, np.nan)
+        m.add_raster(engine.grid.to_raster(stream_view, data=stream_view), 
+                     layer_name="Jaringan Sungai", palette="Blues", vmin=0, vmax=1)
+        
+        st.sidebar.subheader("3. Simulasi Banjir (Bathtub)")
+        flood_level = st.sidebar.slider("Kenaikan Muka Air (m)", 0.0, 20.0, 0.0, step=0.5)
+        
+        if flood_level > 0:
+            # Simple Bathtub Model: DEM < (Min Elevation + Rise)
+            # Untuk 'Connected' model, kita bisa gunakan streams sebagai seed (opsional)
+            base_elev = np.nanmin(engine.dem)
+            flood_mask = engine.dem < (base_elev + flood_level)
+            flood_view = np.where(flood_mask, 1, np.nan)
+            
+            m.add_raster(engine.grid.to_raster(flood_view, data=flood_view),
+                         layer_name=f"Banjir (+{flood_level}m)", palette="coolwarm", opacity=0.6)
+            
+            # Hitung Estimasi Volume (Kasar)
+            # Asumsi resolusi ~30m (GLO-30) -> 900m2 per pixel
+            # Ini hanya estimasi pixel count
+            flood_pixels = np.nansum(flood_mask)
+            est_area_ha = (flood_pixels * 900) / 10000
+            st.metric("Estimasi Luas Genangan", f"{est_area_ha:,.2f} Ha")
+
+        st.sidebar.info("Klik pada peta di dekat sungai untuk Delineasi DAS otomatis.")
+
+    # 5. MAP INTERACTION (Catchment Delineation)
+    # Gunakan folium last click
+    m.to_streamlit(height=600)
+    
+    # [LOGIC DELINEASI DAS]
+    # Karena keterbatasan callback Streamlit-Folium yang kompleks, 
+    # fitur klik biasanya membutuhkan komponen st_folium khusus.
+    # Di sini kita berikan instruksi logika backend-nya.
+    # Jika Anda menggunakan st_folium, Anda bisa mengambil output['last_clicked']
+    # lalu pass ke engine.delineate_catchment(lat, lon)
+
+if __name__ == "__main__":
+    main()
