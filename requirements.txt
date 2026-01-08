@@ -3,9 +3,10 @@ pandas
 ezdxf
 shapely
 matplotlib
-openpyxl
-xlrd>=2.0.1
+numpy
 geopandas
 rasterio
-xlsxwriter
-
+folium
+streamlit-folium
+scikit-image
+protobuf>=4.21.0
