@@ -12,5 +12,13 @@ scipy
 numpy
 matplotlib
 streamlit-folium
+pandas
+matplotlib
+ezdxf
+rasterio
+pystac-client
+planetary-computer
+xlsxwriter
+
 
 
