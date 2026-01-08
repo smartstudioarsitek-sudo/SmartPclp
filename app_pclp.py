@@ -9,8 +9,8 @@ import io
 import numpy as np
 import math
 
-Konfigurasi Halaman
-st.set_page_config(page_title="PCLP Studio Pro v6.1", layout="wide", page_icon="🚜")
+# Konfigurasi Halaman
+# st.set_page_config(page_title="PCLP Studio Pro v6.1", layout="wide", page_icon="🚜")
 
 # Cek Library Geospasial
 HAS_GEO_LIBS = False
@@ -487,4 +487,5 @@ with tabs[2]:
                     st.error(f"Gagal render: {err}")
                     if not HAS_GEO_LIBS:
                         st.warning("Tips: Pastikan install `geopandas` dan `rasterio`.")
+
 
