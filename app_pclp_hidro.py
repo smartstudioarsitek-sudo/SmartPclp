@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-# KONFIGURASI HALAMAN
+KONFIGURASI HALAMAN
 st.set_page_config(page_title="Smart PCLP Studio v7.1", layout="wide", page_icon="🚜")
 
 # ==============================================================================
@@ -347,4 +347,5 @@ elif pilihan_menu == "2. Desain Sipil (Cross/Long)":
             st.pyplot(fig)
             dxf_long = generate_dxf((pts, []), "long")
             st.download_button("📥 Download DXF Long", dxf_long, "long_section.dxf")
+
 
