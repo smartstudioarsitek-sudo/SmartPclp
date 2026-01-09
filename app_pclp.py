@@ -108,9 +108,8 @@ def generate_dxf(results, mode="cross"):
             if t_pts: msp.add_lwpolyline(t_pts, dxfattribs={'layer': 'TANAH'})
             if d_pts: msp.add_lwpolyline(d_pts, dxfattribs={'layer': 'DESAIN'})
             
-            # Teks Info (STA & Area)
             info_txt = f"{item['STA']}"
-            if d_pts: # Hanya tampilkan cut/fill jika ada desain
+            if d_pts:
                 info_txt += f" | C:{item['cut']:.2f} | F:{item['fill']:.2f}"
             
             msp.add_text(info_txt, dxfattribs={'height': 0.5, 'layer': 'TEXT'}).set_placement((offset_x, offset_y))
@@ -157,8 +156,8 @@ def extract_cross_section_from_dem(dem_file, shp_file, interval=50, width_left=2
     """Ekstraksi Cross Section dari DEM berdasarkan Trase."""
     if not HAS_GEO_LIBS: return None, None, "Library GIS Missing"
     
-    cross_data_app = [] # Format untuk aplikasi (List of Dict)
-    cross_data_civil = [] # Format Excel Civil 3D (Station, Offset, Elev)
+    cross_data_app = [] 
+    cross_data_civil = [] 
     
     try:
         with rasterio.open(dem_file) as src:
@@ -170,33 +169,30 @@ def extract_cross_section_from_dem(dem_file, shp_file, interval=50, width_left=2
             length = line.length
             
             # Loop setiap interval (STA)
-            for dist in np.arange(0, length + 0.1, interval): # +0.1 agar ujung terbaca
-                # Hitung Titik Pusat & Vektor Normal (Tegak Lurus)
+            for dist in np.arange(0, length + 0.1, interval):
+                # Hitung Titik Pusat & Vektor Normal
                 pt_center = line.interpolate(dist)
                 
-                # Trik hitung vektor: ambil titik sedikit di depan & belakang
                 p_back = line.interpolate(max(0, dist - 0.1))
                 p_front = line.interpolate(min(length, dist + 0.1))
                 
                 dx = p_front.x - p_back.x
                 dy = p_front.y - p_back.y
                 
-                # Vektor Normal (-dy, dx)
-                len_v = math.sqrt(dx*2 + dy*2)
+                # --- FIX: MATH DOMAIN ERROR ---
+                # Menggunakan pangkat dua (**2) bukan dikali dua (*2)
+                len_v = math.sqrt(dx**2 + dy**2)
+                
                 if len_v == 0: continue
                 nx, ny = -dy/len_v, dx/len_v
                 
-                # Buat titik-titik sampling dari Kiri (-) ke Kanan (+)
                 offsets = np.arange(-width_left, width_right + 0.1, step)
-                
                 points_tanah = []
                 
                 for offset in offsets:
-                    # Koordinat Sampling Real
                     sample_x = pt_center.x + (nx * offset)
                     sample_y = pt_center.y + (ny * offset)
                     
-                    # Ambil Elevasi
                     elev = np.nan
                     try:
                         for val in src.sample([(sample_x, sample_y)]):
@@ -214,12 +210,11 @@ def extract_cross_section_from_dem(dem_file, shp_file, interval=50, width_left=2
                             'Northing': sample_y
                         })
                 
-                # Simpan untuk App Viewer
                 if points_tanah:
                     cross_data_app.append({
                         'STA': f"STA {int(dist)}+00",
                         'points_tanah': points_tanah,
-                        'points_desain': [], # Kosongkan desain
+                        'points_desain': [], 
                         'cut': 0.0,
                         'fill': 0.0
                     })
