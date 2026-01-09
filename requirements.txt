@@ -2,9 +2,9 @@ streamlit
 geopandas
 rasterio
 leafmap
+rioxarray
 pystac-client
 planetary-computer
-rioxarray
 pysheds
 shapely
 fiona
@@ -13,15 +13,6 @@ numpy
 matplotlib
 streamlit-folium
 pandas
-matplotlib
 ezdxf
-rasterio
-pystac-client
-planetary-computer
 xlsxwriter
-localtileserver
 psutil
-
-
-
-
