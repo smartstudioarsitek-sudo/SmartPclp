@@ -1,61 +1,125 @@
-# ... (Bagian atas kode HydroEngine tetap sama, tidak perlu diubah) ...
+import streamlit as st
+import tempfile
+import os
 
-    # TAMPILKAN PETA
-    if 'active_dem' in st.session_state:
-        st.subheader("2. Peta Interaktif")
-        
-        # UPDATE: Set default ke Satellite Hybrid agar sungai terlihat jelas
-        m = leafmap.Map(google_map="HYBRID") 
-        
-        # Coba visualisasi DEM (Jika ringan akan muncul, jika berat di-skip)
+# --- IMPORT LIBRARY ---
+try:
+    import geopandas as gpd
+    import rasterio
+    from pysheds.grid import Grid
+    import leafmap.foliumap as leafmap
+    from streamlit_folium import st_folium
+    from shapely.geometry import Polygon
+    import fiona
+except ImportError:
+    pass
+
+# ==========================================
+# HYDRO ENGINE
+# ==========================================
+class HydroEngine:
+    def __init__(self, dem_path):
+        self.grid = Grid.from_raster(dem_path)
+        self.dem = self.grid.read_raster(dem_path)
+        self.grid.add_gridded_data(self.dem, data_name='dem')
+        self.fdir = None 
+        self.acc = None
+
+    def condition_dem(self):
+        flooded_dem = self.grid.fill_depressions(self.dem)
+        inflated_dem = self.grid.resolve_flats(flooded_dem)
+        dirmap = (64, 128, 1, 2, 4, 8, 16, 32)
+        self.fdir = self.grid.flowdir(inflated_dem, dirmap=dirmap)
+        self.acc = self.grid.accumulation(self.fdir, dirmap=dirmap)
+
+    def delineate(self, x, y):
+        if self.fdir is None: return None
         try:
-            m.add_raster(st.session_state['active_dem'], layer_name="Topografi (DEM)", colormap="terrain", opacity=0.6)
-        except:
-            # Jika gagal visualisasi, beri info tapi JANGAN STOP program
-            st.caption("ℹ️ Visualisasi warna topografi dinonaktifkan demi performa. Silakan klik berdasarkan panduan Peta Satelit.")
+            snapped = self.grid.snap_to_mask(self.acc > 100, (x, y))
+            catch = self.grid.catchment(x=snapped[0], y=snapped[1], fdir=self.fdir, dirmap=(64, 128, 1, 2, 4, 8, 16, 32), xytype='coordinate')
+            self.grid.clip_to(catch)
+            shapes = self.grid.polygonize()
+            for shape, value in shapes:
+                if value == 1: return Polygon(shape['coordinates'][0])
+        except: return None
+        return None
 
-        # Tampilkan Batas Wilayah (Jika ada)
-        if up_boundary:
-            try:
-                fiona.drvsupport.supported_drivers['KML'] = 'rw'
-                fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up_boundary.name.split('.')[-1]}") as tmp:
-                    tmp.write(up_boundary.getbuffer())
-                    tmp_path = tmp.name
-                
-                gdf = gpd.read_file(tmp_path)
-                bounds = gdf.total_bounds
-                m.zoom_to_bounds((bounds[0], bounds[1], bounds[2], bounds[3]))
-                
-                # Tampilkan garis batas dengan warna cerah
-                style = {'fillColor': '#00000000', 'color': 'cyan', 'weight': 3}
-                m.add_gdf(gdf, layer_name="Batas Wilayah", style=style)
-            except: pass
+# ==========================================
+# UI HIDROLOGI
+# ==========================================
+st.title("💧 Analisis Hidrologi & DAS")
+c1, c2 = st.columns([1, 2])
+
+with c1:
+    st.subheader("1. Sumber Data")
+    
+    # Cek Data Kiriman dari Modul Sipil
+    shared_path = st.session_state.get('shared_dem_path')
+    
+    # Tampilkan Tombol Ambil Data jika ada
+    if shared_path and os.path.exists(shared_path):
+        st.info("📦 Terdeteksi DEM dari Modul Sipil")
+        if st.button("🔄 Pakai Data Modul Sipil"):
+            st.session_state['active_dem'] = shared_path
+            st.success("Data berhasil dimuat!")
+            st.rerun()
             
-        map_out = st_folium(m, height=500, width=None)
-        
-        # LOGIKA KLIK (Tetap Jalan Normal)
-        if map_out and map_out['last_clicked']:
-            lat = map_out['last_clicked']['lat']
-            lng = map_out['last_clicked']['lng']
-            st.info(f"📍 Koordinat Klik: {lat:.5f}, {lng:.5f}")
-            
+    # Tampilkan Upload Manual jika belum ada data aktif
+    if 'active_dem' not in st.session_state:
+        up = st.file_uploader("Atau Upload Manual (.tif)", type=['tif'])
+        if up:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as f:
+                f.write(up.getbuffer())
+                st.session_state['active_dem'] = f.name
+                st.rerun()
+
+    # Tombol Reset / Ganti File
+    if 'active_dem' in st.session_state:
+        st.success("✅ File DEM Siap")
+        if st.button("❌ Ganti File"):
+            del st.session_state['active_dem']
             if 'engine' in st.session_state:
-                with st.spinner("⏳ Sedang menghitung batas DAS..."):
-                    eng = st.session_state['engine']
-                    poly_das = eng.delineate(lng, lat)
+                del st.session_state['engine']
+            st.rerun()
+            
+    st.markdown("---")
+    btn_proc = st.button("🌊 PROSES FLOW DIRECTION")
+
+with c2:
+    # Proses Analisis
+    if btn_proc and 'active_dem' in st.session_state:
+        with st.spinner("Menganalisis Arah Aliran..."):
+            try:
+                eng = HydroEngine(st.session_state['active_dem'])
+                eng.condition_dem()
+                st.session_state['engine'] = eng
+                st.success("✅ Selesai! Klik peta untuk delineasi.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # Peta Interaktif
+    if 'active_dem' in st.session_state:
+        m = leafmap.Map()
+        try:
+            m.add_raster(st.session_state['active_dem'], layer_name="DEM", colormap="terrain")
+        except: pass
+        
+        out = st_folium(m, height=500, width=None)
+        
+        # Delineasi saat klik
+        if out and out['last_clicked'] and 'engine' in st.session_state:
+            lat = out['last_clicked']['lat']
+            lng = out['last_clicked']['lng']
+            st.info(f"Titik Klik: {lat}, {lng}")
+            
+            with st.spinner("Delineasi DAS..."):
+                poly = st.session_state['engine'].delineate(lng, lat)
+                if poly:
+                    area = poly.area * 12391 # Estimasi kasar konversi ke km2
+                    st.success(f"✅ Luas DAS: {area:.2f} km² (Estimasi)")
                     
-                    if poly_das:
-                        area_km2 = (poly_das.area * 111.32 * 111.32) # Estimasi kasar area
-                        st.success(f"✅ DAS Berhasil Dibuat! Luas: ±{area_km2:.2f} km²")
-                        
-                        # Siapkan Download
-                        gdf_res = gpd.GeoDataFrame(index=[0], crs="EPSG:4326", geometry=[poly_das])
-                        st.download_button(
-                            label="📥 Download GeoJSON DAS",
-                            data=gdf_res.to_json(),
-                            file_name="hasil_das.geojson",
-                            mime="application/json"
-                        )
-                    else:
-                        st.warning("⚠️ Titik klik di luar alur sungai. Coba klik pas di tengah lembah/sungai pada peta satelit.")
+                    # Download
+                    gdf_res = gpd.GeoDataFrame(geometry=[poly], crs="EPSG:4326")
+                    st.download_button("📥 Download GeoJSON", gdf_res.to_json(), "das.geojson")
+                else:
+                    st.warning("Gagal delineasi. Pastikan klik tepat di alur sungai.")
