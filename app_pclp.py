@@ -108,7 +108,11 @@ def generate_dxf(results, mode="cross"):
             if t_pts: msp.add_lwpolyline(t_pts, dxfattribs={'layer': 'TANAH'})
             if d_pts: msp.add_lwpolyline(d_pts, dxfattribs={'layer': 'DESAIN'})
             
-            info_txt = f"{item['STA']} | C:{item['cut']:.2f} | F:{item['fill']:.2f}"
+            # Teks Info (STA & Area)
+            info_txt = f"{item['STA']}"
+            if d_pts: # Hanya tampilkan cut/fill jika ada desain
+                info_txt += f" | C:{item['cut']:.2f} | F:{item['fill']:.2f}"
+            
             msp.add_text(info_txt, dxfattribs={'height': 0.5, 'layer': 'TEXT'}).set_placement((offset_x, offset_y))
 
     out = io.StringIO()
@@ -127,72 +131,120 @@ def generate_excel_report(data):
 # ==========================================
 # 3. GEOSPATIAL ENGINE (EXTRACTION)
 # ==========================================
-def extract_long_section_from_dem(dem_file, shp_file, interval=25): # UPDATE: Default jadi 25
-    """
-    Mengambil data elevasi dari DEM berdasarkan garis shapefile.
-    Output: DataFrame (Jarak, Z, X, Y)
-    """
+def extract_long_section_from_dem(dem_file, shp_file, interval=25):
     if not HAS_GEO_LIBS: return None, "Library GIS Missing"
-    
     try:
         with rasterio.open(dem_file) as src:
             gdf = gpd.read_file(shp_file)
-            
-            # Reproyeksi Shapefile agar sama dengan DEM
-            if gdf.crs != src.crs:
-                gdf = gdf.to_crs(src.crs)
-            
-            # Ambil geometri garis pertama
+            if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
             line = gdf.geometry.iloc[0]
-            if line.geom_type == 'MultiLineString':
-                line = line.geoms[0] # Ambil bagian pertama saja jika multiline
-                
+            if line.geom_type == 'MultiLineString': line = line.geoms[0]
+            
             length = line.length
             points_data = []
-            
-            # Loop sepanjang garis (Stationing)
             for dist in np.arange(0, length, interval):
                 pt = line.interpolate(dist)
-                
-                # Sampling Elevasi dari DEM
-                # src.sample butuh list of (x, y)
                 try:
                     for val in src.sample([(pt.x, pt.y)]):
                         elev = val[0]
                         if elev == src.nodata: elev = np.nan
-                        points_data.append({
-                            'Station (m)': dist,
-                            'Elevation (m)': elev,
-                            'X (Easting)': pt.x,
-                            'Y (Northing)': pt.y
-                        })
-                except:
-                    points_data.append({'Station (m)': dist, 'Elevation (m)': np.nan, 'X': pt.x, 'Y': pt.y})
-
+                        points_data.append({'Station (m)': dist, 'Elevation (m)': elev, 'X': pt.x, 'Y': pt.y})
+                except: pass
             return pd.DataFrame(points_data), None
+    except Exception as e: return None, str(e)
+
+def extract_cross_section_from_dem(dem_file, shp_file, interval=50, width_left=25, width_right=25, step=1.0):
+    """Ekstraksi Cross Section dari DEM berdasarkan Trase."""
+    if not HAS_GEO_LIBS: return None, None, "Library GIS Missing"
+    
+    cross_data_app = [] # Format untuk aplikasi (List of Dict)
+    cross_data_civil = [] # Format Excel Civil 3D (Station, Offset, Elev)
+    
+    try:
+        with rasterio.open(dem_file) as src:
+            gdf = gpd.read_file(shp_file)
+            if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
+            line = gdf.geometry.iloc[0]
+            if line.geom_type == 'MultiLineString': line = line.geoms[0]
+            
+            length = line.length
+            
+            # Loop setiap interval (STA)
+            for dist in np.arange(0, length + 0.1, interval): # +0.1 agar ujung terbaca
+                # Hitung Titik Pusat & Vektor Normal (Tegak Lurus)
+                pt_center = line.interpolate(dist)
+                
+                # Trik hitung vektor: ambil titik sedikit di depan & belakang
+                p_back = line.interpolate(max(0, dist - 0.1))
+                p_front = line.interpolate(min(length, dist + 0.1))
+                
+                dx = p_front.x - p_back.x
+                dy = p_front.y - p_back.y
+                
+                # Vektor Normal (-dy, dx)
+                len_v = math.sqrt(dx*2 + dy*2)
+                if len_v == 0: continue
+                nx, ny = -dy/len_v, dx/len_v
+                
+                # Buat titik-titik sampling dari Kiri (-) ke Kanan (+)
+                offsets = np.arange(-width_left, width_right + 0.1, step)
+                
+                points_tanah = []
+                
+                for offset in offsets:
+                    # Koordinat Sampling Real
+                    sample_x = pt_center.x + (nx * offset)
+                    sample_y = pt_center.y + (ny * offset)
+                    
+                    # Ambil Elevasi
+                    elev = np.nan
+                    try:
+                        for val in src.sample([(sample_x, sample_y)]):
+                            elev = val[0]
+                            if elev == src.nodata: elev = np.nan
+                    except: pass
+                    
+                    if not np.isnan(elev):
+                        points_tanah.append((offset, elev))
+                        cross_data_civil.append({
+                            'Station': dist,
+                            'Offset': offset,
+                            'Elevation': elev,
+                            'Easting': sample_x,
+                            'Northing': sample_y
+                        })
+                
+                # Simpan untuk App Viewer
+                if points_tanah:
+                    cross_data_app.append({
+                        'STA': f"STA {int(dist)}+00",
+                        'points_tanah': points_tanah,
+                        'points_desain': [], # Kosongkan desain
+                        'cut': 0.0,
+                        'fill': 0.0
+                    })
+                    
+        return cross_data_app, pd.DataFrame(cross_data_civil), None
+
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
 
 def render_peta_situasi(dem_file, shp_file):
-    # (Fungsi rendering visual saja, sama seperti sebelumnya)
     if not HAS_GEO_LIBS: return None, "No GIS Libs"
     try:
         with rasterio.open(dem_file) as src:
             gdf = gpd.read_file(shp_file)
             if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
-            
             fig, ax = plt.subplots(figsize=(10, 8))
             data = src.read(1, out_shape=(src.height//5, src.width//5))
             data_masked = np.ma.masked_where(data == src.nodata, data)
             x = np.linspace(src.bounds.left, src.bounds.right, data.shape[1])
             y = np.linspace(src.bounds.top, src.bounds.bottom, data.shape[0])
             X, Y = np.meshgrid(x, y)
-            
             contours = ax.contour(X, Y, data_masked, levels=20, cmap='terrain', linewidths=0.5)
             ax.clabel(contours, inline=True, fontsize=6, fmt='%1.0f')
             gdf.plot(ax=ax, color='red', linewidth=2, label='Trase', zorder=5)
-            ax.grid(True, linestyle='--', alpha=0.5)
-            ax.set_title("Peta Situasi: Kontur & Trase")
+            ax.grid(True, linestyle='--', alpha=0.5); ax.set_title("Peta Situasi")
             return fig, None
     except Exception as e: return None, str(e)
 
@@ -203,8 +255,7 @@ def render_peta_situasi(dem_file, shp_file):
 st.title("🚜 PCLP Studio Pro v6.1 (Stable)")
 st.caption("Aplikasi Desain Irigasi & Jalan: Cross Section, Long Section & GIS Situasi")
 
-if not HAS_GEO_LIBS:
-    st.warning("⚠️ Modul Geospasial tidak aktif.")
+if not HAS_GEO_LIBS: st.warning("⚠️ Modul Geospasial tidak aktif.")
 
 tabs = st.tabs(["📐 CROSS SECTION", "📈 LONG SECTION", "🗺️ PETA SITUASI (GIS)"])
 
@@ -262,39 +313,40 @@ with tabs[1]:
 
     if 'long_res' in st.session_state:
         ogl, _ = st.session_state['long_res']
-        # Tampilkan Tabel Data untuk dicek user
         with st.expander("Lihat Data Tabel"):
             st.dataframe(pd.DataFrame(ogl, columns=["Jarak (m)", "Elevasi (m)"]))
-
         fig, ax = plt.subplots(figsize=(12, 5))
         ax.plot(*zip(*ogl), 'k--', label='Tanah Asli')
         ax.grid(True); st.pyplot(fig)
         st.download_button("📥 DXF Long", generate_dxf((ogl, []), "long"), "Long.dxf")
 
-# --- TAB 3: PETA SITUASI (UPDATE FITUR EXPORT) ---
+# --- TAB 3: PETA SITUASI (AUTO CROSS SECTION) ---
 with tabs[2]:
     st.header("🗺️ Peta Situasi & Ekstraksi Data")
-    st.caption("Upload DEM & Trase, lalu ekstrak data elevasi untuk Long Section/Civil 3D.")
     
     c1, c2 = st.columns([1, 2])
     with c1:
         up_dem = st.file_uploader("Upload DEM (.tif)", type=['tif', 'tiff'])
         up_shp = st.file_uploader("Upload Trase (.geojson/.shp)", type=['geojson', 'shp'], accept_multiple_files=True)
         
-        # Opsi Interval Sampling (UPDATED: Default 25m, Step 5m)
-        interval = st.number_input("Interval Sampling (m)", min_value=5, max_value=1000, value=25, step=5)
+        st.markdown("---")
+        st.write("⚙️ **Pengaturan Sampling**")
+        interval = st.number_input("Interval Antar STA (m)", 5, 1000, 25, 5)
+        
+        col_w1, col_w2 = st.columns(2)
+        w_left = col_w1.number_input("Lebar Kiri (m)", 5, 100, 25, 5)
+        w_right = col_w2.number_input("Lebar Kanan (m)", 5, 100, 25, 5)
         
         shp_file = None
         if up_shp:
             for f in up_shp:
                 if f.name.endswith('.geojson') or f.name.endswith('.shp'): shp_file = f; break
         
-        # TOMBOL EKSEKUSI
         btn_render = st.button("1. Tampilkan Peta")
-        btn_extract = st.button("2. Ekstrak Data Elevasi (Long Section)")
+        btn_long = st.button("2. Ekstrak Long Section")
+        btn_cross = st.button("3. Ekstrak Cross Section (Auto)")
 
     with c2:
-        # LOGIKA RENDER PETA
         if btn_render and up_dem and shp_file:
             st.session_state['gis_files'] = (up_dem, shp_file)
         
@@ -306,35 +358,43 @@ with tabs[2]:
                 if fig: st.pyplot(fig)
                 else: st.error(err)
 
-        # LOGIKA EKSTRAKSI DATA & EXPORT CIVIL 3D
-        if btn_extract and up_dem and shp_file:
+        # EKSTRAK LONG SECTION
+        if btn_long and up_dem and shp_file:
             up_dem.seek(0); shp_file.seek(0)
-            with st.spinner(f"Mengambil sampel elevasi setiap {interval}m..."):
+            with st.spinner(f"Extracting Long Section ({interval}m)..."):
                 df_long, err = extract_long_section_from_dem(up_dem, shp_file, interval)
-                
                 if df_long is not None:
-                    st.success(f"Berhasil mengekstrak {len(df_long)} titik!")
-                    
-                    # Tampilkan Preview Data
-                    st.dataframe(df_long.head())
-                    
-                    # 1. DOWNLOAD UNTUK CIVIL 3D / EXCEL
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        df_long.to_excel(writer, index=False, sheet_name='Long Section Data')
-                    
-                    st.download_button(
-                        label="📥 Download Excel (Format Civil 3D/Land Desktop)",
-                        data=output.getvalue(),
-                        file_name="Data_Elevasi_Trase.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                    
-                    # 2. KIRIM KE TAB LONG SECTION
-                    # Konversi DataFrame ke List of Lists [[Jarak, Elevasi], ...]
+                    st.success(f"✅ Long Section: {len(df_long)} titik")
+                    # Kirim ke Tab 2
                     long_data = df_long[['Station (m)', 'Elevation (m)']].dropna().values.tolist()
-                    st.session_state['long_res'] = (long_data, []) # Simpan ke Session State
-                    st.info("✅ Data otomatis dikirim ke Tab 'LONG SECTION'. Silakan cek tab sebelah!")
+                    st.session_state['long_res'] = (long_data, [])
+                    st.info("Data dikirim ke Tab 'LONG SECTION'.")
                     
+                    # Download Excel
+                    out = io.BytesIO()
+                    df_long.to_excel(out, index=False)
+                    st.download_button("📥 Download Excel Long", out.getvalue(), "Long_Section.xlsx")
+
+        # EKSTRAK CROSS SECTION
+        if btn_cross and up_dem and shp_file:
+            up_dem.seek(0); shp_file.seek(0)
+            with st.spinner(f"Generating Cross Sections (L:{w_left}m, R:{w_right}m)..."):
+                app_data, df_civil, err = extract_cross_section_from_dem(up_dem, shp_file, interval, w_left, w_right)
+                
+                if app_data:
+                    st.success(f"✅ Berhasil membuat {len(app_data)} Cross Section!")
+                    
+                    # 1. Kirim ke Tab 1 (Viewer)
+                    st.session_state['data_cross'] = app_data
+                    st.info("Grafik dikirim ke Tab 'CROSS SECTION' untuk dipreview.")
+                    
+                    # 2. Download Excel Civil 3D
+                    out_csv = io.BytesIO()
+                    df_civil.to_excel(out_csv, index=False)
+                    st.download_button("📥 Download Excel (Format Civil 3D)", out_csv.getvalue(), "Cross_Section_Civil3D.xlsx")
+                    
+                    # 3. Download DXF
+                    dxf_bytes = generate_dxf(app_data, "cross")
+                    st.download_button("📥 Download DXF (AutoCAD)", dxf_bytes, "Cross_Section_Auto.dxf")
                 else:
-                    st.error(f"Gagal ekstrak: {err}")
+                    st.error(f"Gagal: {err}")
