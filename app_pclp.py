@@ -4,7 +4,6 @@ import numpy as np
 import math
 import io
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
 from shapely.geometry import Polygon, LineString
 
 # --- HANDLING IMPORT LIBRARY ---
@@ -12,7 +11,7 @@ try:
     import ezdxf
     from ezdxf.enums import TextEntityAlignment
 except ImportError:
-    st.warning("⚠️ Library 'ezdxf' belum terinstall. Fitur DXF tidak akan jalan.")
+    st.warning("⚠️ Library 'ezdxf' belum terinstall. Fitur DXF tidak akan jalan. (pip install ezdxf)")
 
 HAS_GEO_LIBS = False
 try:
@@ -24,7 +23,7 @@ except ImportError:
     pass
 
 # ==========================================
-# 1. PARSER ENGINE (ROBUST)
+# 1. PARSER ENGINE & MATH
 # ==========================================
 def parse_pclp_block(df):
     """Parser untuk format Excel Blok PCLP (Cross Section)."""
@@ -79,40 +78,114 @@ def hitung_cut_fill(tanah_pts, desain_pts):
     except: return 0.0, 0.0
 
 # ==========================================
-# 2. GENERATOR OUTPUT
+# 2. GENERATOR OUTPUT (STANDAR KP IRIGASI)
 # ==========================================
 def generate_dxf(results, mode="cross"):
     doc = ezdxf.new('R2010')
+    
+    if 'DASHED' not in doc.linetypes:
+        doc.linetypes.new('DASHED', dxfattribs={'description': 'Dashed', 'pattern': [0.75, 0.5, -0.25]})
+    if 'CENTER' not in doc.linetypes: 
+        doc.linetypes.new('CENTER', dxfattribs={'description': 'Center', 'pattern': [1.25, 0.25, -0.25, 0.25]})
+
     msp = doc.modelspace()
-    doc.layers.add(name='TANAH', color=8)
-    doc.layers.add(name='DESAIN', color=1)
-    doc.layers.add(name='TEXT', color=7)
-    doc.layers.add(name='GRID', color=9)
+    doc.layers.add(name='TANAH_ASLI', color=8, linetype='DASHED') 
+    doc.layers.add(name='DESAIN_RENCANA', color=1, lineweight=30)  
+    doc.layers.add(name='TEXT_DATA', color=2)      
+    doc.layers.add(name='TEXT_LABEL', color=7)     
+    doc.layers.add(name='GRID_MAJOR', color=9, linetype='CENTER') 
+    doc.layers.add(name='FRAME_TABLE', color=7)    
+    doc.layers.add(name='KOP_GAMBAR', color=3)     
+
+    SC_H = 1.0; SC_V = 10.0; ROW_H = 15.0 
+    
+    if "ARIAL" not in doc.styles: doc.styles.new("ARIAL", dxfattribs={'font': 'Arial.ttf'})
+    if "ARIAL_NARROW" not in doc.styles: doc.styles.new("ARIAL_NARROW", dxfattribs={'font': 'Arial Narrow.ttf'})
+
+    def draw_kp_profile(origin_x, origin_y, points_tanah, points_desain, sta_title):
+        all_pts = points_tanah + points_desain
+        if not all_pts: return 0, 0
+        min_x, max_x = min(p[0] for p in all_pts), max(p[0] for p in all_pts)
+        min_y, max_y = min(p[1] for p in all_pts), max(p[1] for p in all_pts)
+        
+        g_min_x = math.floor(min_x / 2.0) * 2.0; g_max_x = math.ceil(max_x / 2.0) * 2.0
+        g_min_y = math.floor(min_y / 1.0) * 1.0; g_max_y = math.ceil(max_y / 1.0) * 1.0
+        
+        datum_graph = g_min_y 
+        graph_w = (g_max_x - g_min_x) * SC_H
+        graph_h = (g_max_y - g_min_y) * SC_V
+        TABLE_OFFSET_Y = 3 * ROW_H 
+        base_graph_x = origin_x
+        base_graph_y = origin_y + TABLE_OFFSET_Y
+
+        curr_x = g_min_x
+        while curr_x <= g_max_x + 0.01:
+            draw_x = base_graph_x + (curr_x - g_min_x) * SC_H
+            msp.add_line((draw_x, base_graph_y + graph_h), (draw_x, origin_y), dxfattribs={'layer': 'GRID_MAJOR'})
+            
+            def get_elev(pts, x_val):
+                for k in range(len(pts)-1):
+                    p1, p2 = pts[k], pts[k+1]
+                    if p1[0] <= x_val <= p2[0]:
+                        ratio = (x_val - p1[0]) / (p2[0] - p1[0]) if (p2[0]-p1[0]) !=0 else 0
+                        return p1[1] + ratio * (p2[1] - p1[1])
+                return None
+
+            z_tanah, z_desain = get_elev(points_tanah, curr_x), get_elev(points_desain, curr_x)
+            
+            txt_dist = msp.add_text(f"{curr_x:.1f}", dxfattribs={'height': 1.8, 'layer': 'TEXT_DATA', 'style': 'ARIAL_NARROW', 'rotation': 90})
+            txt_dist.set_placement((draw_x + 1, origin_y + (0.5 * ROW_H)), align=TextEntityAlignment.MIDDLE_CENTER)
+            if z_tanah is not None:
+                txt_t = msp.add_text(f"{z_tanah:.2f}", dxfattribs={'height': 1.8, 'layer': 'TEXT_DATA', 'style': 'ARIAL_NARROW', 'rotation': 90})
+                txt_t.set_placement((draw_x + 1, origin_y + (1.5 * ROW_H)), align=TextEntityAlignment.MIDDLE_CENTER)
+            if z_desain is not None:
+                txt_d = msp.add_text(f"{z_desain:.2f}", dxfattribs={'height': 1.8, 'layer': 'TEXT_DATA', 'style': 'ARIAL_NARROW', 'rotation': 90})
+                txt_d.set_placement((draw_x + 1, origin_y + (2.5 * ROW_H)), align=TextEntityAlignment.MIDDLE_CENTER)
+            curr_x += 2.0 
+            
+        if points_tanah:
+            p_draw = [(base_graph_x + (p[0]-g_min_x)*SC_H, base_graph_y + (p[1]-datum_graph)*SC_V) for p in points_tanah]
+            msp.add_lwpolyline(p_draw, dxfattribs={'layer': 'TANAH_ASLI'})
+        if points_desain:
+            p_draw = [(base_graph_x + (p[0]-g_min_x)*SC_H, base_graph_y + (p[1]-datum_graph)*SC_V) for p in points_desain]
+            msp.add_lwpolyline(p_draw, dxfattribs={'layer': 'DESAIN_RENCANA'})
+
+        width_tot = graph_w
+        for i in range(4):
+            y_line = origin_y + (i * ROW_H)
+            msp.add_line((origin_x, y_line), (origin_x + width_tot, y_line), dxfattribs={'layer': 'FRAME_TABLE'})
+        
+        msp.add_line((origin_x, base_graph_y + graph_h), (origin_x + width_tot, base_graph_y + graph_h), dxfattribs={'layer': 'FRAME_TABLE'})
+        msp.add_line((origin_x, origin_y), (origin_x, base_graph_y + graph_h), dxfattribs={'layer': 'FRAME_TABLE'})
+        msp.add_line((origin_x + width_tot, origin_y), (origin_x + width_tot, base_graph_y + graph_h), dxfattribs={'layer': 'FRAME_TABLE'})
+
+        offset_lbl = -2.0
+        msp.add_text("JARAK", dxfattribs={'height': 2.0, 'layer': 'TEXT_LABEL', 'style': 'ARIAL'}).set_placement((origin_x + offset_lbl, origin_y + 0.5*ROW_H), align=TextEntityAlignment.MIDDLE_RIGHT)
+        msp.add_text("ELEV. TANAH", dxfattribs={'height': 2.0, 'layer': 'TEXT_LABEL', 'style': 'ARIAL'}).set_placement((origin_x + offset_lbl, origin_y + 1.5*ROW_H), align=TextEntityAlignment.MIDDLE_RIGHT)
+        msp.add_text("ELEV. DESAIN", dxfattribs={'height': 2.0, 'layer': 'TEXT_LABEL', 'style': 'ARIAL'}).set_placement((origin_x + offset_lbl, origin_y + 2.5*ROW_H), align=TextEntityAlignment.MIDDLE_RIGHT)
+        
+        curr_y = g_min_y
+        while curr_y <= g_max_y:
+            y_pos = base_graph_y + (curr_y - g_min_y) * SC_V
+            msp.add_line((origin_x, y_pos), (origin_x + width_tot, y_pos), dxfattribs={'layer': 'GRID_MAJOR'})
+            msp.add_text(f"{curr_y:.2f}", dxfattribs={'height': 2.0, 'layer': 'TEXT_LABEL'}).set_placement((origin_x - 1, y_pos), align=TextEntityAlignment.MIDDLE_RIGHT)
+            curr_y += 1.0
+
+        msp.add_text(sta_title, dxfattribs={'height': 4.0, 'layer': 'TEXT_LABEL', 'style': 'ARIAL'}).set_placement((origin_x + width_tot/2, base_graph_y + graph_h + 5), align=TextEntityAlignment.CENTER)
+        msp.add_text(f"DATUM {datum_graph:.2f}", dxfattribs={'height': 2.5, 'layer': 'TEXT_LABEL'}).set_placement((origin_x - 5, base_graph_y), align=TextEntityAlignment.MIDDLE_RIGHT)
+        return graph_w, graph_h + TABLE_OFFSET_Y 
 
     if mode == "long":
         tanah, desain = results
-        if tanah: msp.add_lwpolyline(tanah, dxfattribs={'layer': 'TANAH'})
-        if desain: msp.add_lwpolyline(desain, dxfattribs={'layer': 'DESAIN'})
-        if tanah:
-            min_x, max_x = min(p[0] for p in tanah), max(p[0] for p in tanah)
-            min_y, max_y = min(p[1] for p in tanah), max(p[1] for p in tanah)
-            msp.add_line((min_x, min_y), (max_x, min_y), dxfattribs={'layer': 'GRID'})
-            msp.add_text("LONG SECTION PROFILE", dxfattribs={'height': 2.0, 'layer': 'TEXT'}).set_placement((min_x, max_y + 5))
+        draw_kp_profile(0, 0, tanah, desain, "LONG SECTION PROFILE")
     else:
-        for i, item in enumerate(results):
-            col = i % 2; row = i // 2
-            offset_x = col * 60; offset_y = row * -40
-            t_pts = [(p[0]+ox, p[1]+oy) for p, ox, oy in [(pt, offset_x, offset_y) for pt in item.get('points_tanah', [])]]
-            d_pts = [(p[0]+ox, p[1]+oy) for p, ox, oy in [(pt, offset_x, offset_y) for pt in item.get('points_desain', [])]]
-            
-            if t_pts: msp.add_lwpolyline(t_pts, dxfattribs={'layer': 'TANAH'})
-            if d_pts: msp.add_lwpolyline(d_pts, dxfattribs={'layer': 'DESAIN'})
-            
-            info_txt = f"{item['STA']}"
-            if d_pts:
-                info_txt += f" | C:{item['cut']:.2f} | F:{item['fill']:.2f}"
-            
-            msp.add_text(info_txt, dxfattribs={'height': 0.5, 'layer': 'TEXT'}).set_placement((offset_x, offset_y))
+        curr_x = 0; curr_y = 0; max_h_row = 0
+        for item in results:
+            w, h = draw_kp_profile(curr_x, curr_y, item.get('points_tanah', []), item.get('points_desain', []), item['STA'])
+            curr_x += w + 50 
+            max_h_row = max(max_h_row, h)
+            if curr_x > 500: 
+                curr_x = 0; curr_y -= (max_h_row + 50); max_h_row = 0
 
     out = io.StringIO()
     doc.write(out)
@@ -128,7 +201,7 @@ def generate_excel_report(data):
     return output.getvalue()
 
 # ==========================================
-# 3. GEOSPATIAL ENGINE (EXTRACTION)
+# 3. GEOSPATIAL ENGINE
 # ==========================================
 def extract_long_section_from_dem(dem_file, shp_file, interval=25):
     if not HAS_GEO_LIBS: return None, "Library GIS Missing"
@@ -138,7 +211,6 @@ def extract_long_section_from_dem(dem_file, shp_file, interval=25):
             if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
             line = gdf.geometry.iloc[0]
             if line.geom_type == 'MultiLineString': line = line.geoms[0]
-            
             length = line.length
             points_data = []
             for dist in np.arange(0, length, interval):
@@ -153,76 +225,40 @@ def extract_long_section_from_dem(dem_file, shp_file, interval=25):
     except Exception as e: return None, str(e)
 
 def extract_cross_section_from_dem(dem_file, shp_file, interval=50, width_left=25, width_right=25, step=1.0):
-    """Ekstraksi Cross Section dari DEM berdasarkan Trase."""
     if not HAS_GEO_LIBS: return None, None, "Library GIS Missing"
-    
-    cross_data_app = [] 
-    cross_data_civil = [] 
-    
+    cross_data_app = []; cross_data_civil = [] 
     try:
         with rasterio.open(dem_file) as src:
             gdf = gpd.read_file(shp_file)
             if gdf.crs != src.crs: gdf = gdf.to_crs(src.crs)
             line = gdf.geometry.iloc[0]
             if line.geom_type == 'MultiLineString': line = line.geoms[0]
-            
             length = line.length
-            
-            # Loop setiap interval (STA)
             for dist in np.arange(0, length + 0.1, interval):
-                # Hitung Titik Pusat & Vektor Normal
                 pt_center = line.interpolate(dist)
-                
                 p_back = line.interpolate(max(0, dist - 0.1))
                 p_front = line.interpolate(min(length, dist + 0.1))
-                
-                dx = p_front.x - p_back.x
-                dy = p_front.y - p_back.y
-                
-                # --- FIX: MATH DOMAIN ERROR ---
-                # Menggunakan pangkat dua (**2) bukan dikali dua (*2)
+                dx = p_front.x - p_back.x; dy = p_front.y - p_back.y
                 len_v = math.sqrt(dx**2 + dy**2)
-                
                 if len_v == 0: continue
                 nx, ny = -dy/len_v, dx/len_v
-                
                 offsets = np.arange(-width_left, width_right + 0.1, step)
                 points_tanah = []
-                
                 for offset in offsets:
-                    sample_x = pt_center.x + (nx * offset)
-                    sample_y = pt_center.y + (ny * offset)
-                    
+                    sample_x = pt_center.x + (nx * offset); sample_y = pt_center.y + (ny * offset)
                     elev = np.nan
                     try:
                         for val in src.sample([(sample_x, sample_y)]):
                             elev = val[0]
                             if elev == src.nodata: elev = np.nan
                     except: pass
-                    
                     if not np.isnan(elev):
                         points_tanah.append((offset, elev))
-                        cross_data_civil.append({
-                            'Station': dist,
-                            'Offset': offset,
-                            'Elevation': elev,
-                            'Easting': sample_x,
-                            'Northing': sample_y
-                        })
-                
+                        cross_data_civil.append({'Station': dist, 'Offset': offset, 'Elevation': elev, 'Easting': sample_x, 'Northing': sample_y})
                 if points_tanah:
-                    cross_data_app.append({
-                        'STA': f"STA {int(dist)}+00",
-                        'points_tanah': points_tanah,
-                        'points_desain': [], 
-                        'cut': 0.0,
-                        'fill': 0.0
-                    })
-                    
+                    cross_data_app.append({'STA': f"STA {int(dist)}+00", 'points_tanah': points_tanah, 'points_desain': [], 'cut': 0.0, 'fill': 0.0})
         return cross_data_app, pd.DataFrame(cross_data_civil), None
-
-    except Exception as e:
-        return None, None, str(e)
+    except Exception as e: return None, None, str(e)
 
 def render_peta_situasi(dem_file, shp_file):
     if not HAS_GEO_LIBS: return None, "No GIS Libs"
@@ -243,22 +279,103 @@ def render_peta_situasi(dem_file, shp_file):
             return fig, None
     except Exception as e: return None, str(e)
 
-
 # ==========================================
 # 4. MAIN UI
 # ==========================================
-st.title("🚜 PCLP Studio Pro v6.1 (Stable)")
+st.set_page_config(page_title="PCLP Studio", layout="wide")
+st.title("🚜 PCLP Studio Pro v6.3 (Stable)")
 st.caption("Aplikasi Desain Irigasi & Jalan: Cross Section, Long Section & GIS Situasi")
 
 if not HAS_GEO_LIBS: st.warning("⚠️ Modul Geospasial tidak aktif.")
 
-tabs = st.tabs(["📐 CROSS SECTION", "📈 LONG SECTION", "🗺️ PETA SITUASI (GIS)"])
+# --- INISIALISASI SESSION STATE (ANTI CRASH) ---
+if 'data_cross' not in st.session_state:
+    st.session_state['data_cross'] = []
+if 'long_res' not in st.session_state:
+    st.session_state['long_res'] = ([], [])
 
-# --- TAB 1: CROSS SECTION ---
+# --- MENYUSUN TAB SESUAI URUTAN BARU ---
+tabs = st.tabs(["📖 MANUAL BOOK", "🗺️ PETA SITUASI (GIS)", "📈 LONG SECTION", "📐 CROSS SECTION"])
+
+# --- TAB 1: MANUAL BOOK ---
 with tabs[0]:
+    st.markdown("""
+    ## 📖 Panduan Penggunaan Aplikasi
+    Selamat datang di **PCLP Studio Pro**. Aplikasi ini membantu insinyur sipil untuk mengolah data pengukuran tanah, 
+    menghitung volume cut & fill, serta ekstraksi data topografi otomatis.
+    """)
+
+# --- TAB 2: PETA SITUASI (GIS) ---
+with tabs[1]:
+    st.header("🗺️ Peta Situasi & Ekstraksi Data")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        up_dem = st.file_uploader("Upload DEM (.tif)", type=['tif', 'tiff'])
+        up_shp = st.file_uploader("Upload Trase (.geojson/.shp)", type=['geojson', 'shp'], accept_multiple_files=True)
+        st.markdown("---")
+        interval = st.number_input("Interval Antar STA (m)", 5, 1000, 25, 5)
+        col_w1, col_w2 = st.columns(2)
+        w_left = col_w1.number_input("Lebar Kiri (m)", 5, 100, 25, 5)
+        w_right = col_w2.number_input("Lebar Kanan (m)", 5, 100, 25, 5)
+        shp_file = None
+        if up_shp:
+            for f in up_shp:
+                if f.name.endswith('.geojson') or f.name.endswith('.shp'): shp_file = f; break
+        btn_render = st.button("1. Tampilkan Peta")
+        btn_long = st.button("2. Ekstrak Long Section")
+        btn_cross = st.button("3. Ekstrak Cross Section (Auto)")
+    with c2:
+        if btn_render and up_dem and shp_file:
+            st.session_state['gis_files'] = (up_dem, shp_file)
+        if 'gis_files' in st.session_state:
+            dem, shp = st.session_state['gis_files']
+            dem.seek(0); shp.seek(0)
+            with st.spinner("Merender Peta..."):
+                fig, err = render_peta_situasi(dem, shp)
+                if fig: st.pyplot(fig)
+        if btn_long and up_dem and shp_file:
+            up_dem.seek(0); shp_file.seek(0)
+            with st.spinner(f"Extracting Long Section ({interval}m)..."):
+                df_long, err = extract_long_section_from_dem(up_dem, shp_file, interval)
+                if df_long is not None:
+                    st.success(f"✅ Long Section: {len(df_long)} titik")
+                    long_data = df_long[['Station (m)', 'Elevation (m)']].dropna().values.tolist()
+                    st.session_state['long_res'] = (long_data, [])
+                    st.info("Data berhasil dikirim ke Tab 'LONG SECTION'.")
+        if btn_cross and up_dem and shp_file:
+            up_dem.seek(0); shp_file.seek(0)
+            with st.spinner(f"Generating Cross Sections..."):
+                app_data, df_civil, err = extract_cross_section_from_dem(up_dem, shp_file, interval, w_left, w_right)
+                if app_data:
+                    st.session_state['data_cross'] = app_data
+                    st.success(f"✅ Berhasil: {len(app_data)} Cross Section!")
+                    st.info("Data berhasil dikirim ke Tab 'CROSS SECTION'.")
+
+# --- TAB 3: LONG SECTION ---
+with tabs[2]:
+    st.subheader("Long Section")
+    f_long = st.file_uploader("Upload Long", type=['xls', 'xlsx', 'csv'], key='long_up')
+    if f_long:
+        try:
+            df = pd.read_csv(f_long) if f_long.name.endswith('.csv') else pd.read_excel(f_long)
+            st.session_state['long_res'] = (df.iloc[:, :2].dropna().values.tolist(), [])
+            st.success("Data masuk!")
+        except: st.error("Error file.")
+        
+    ogl, dsn = st.session_state['long_res']
+    if len(ogl) > 0:
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(*zip(*ogl), 'k--', label='Tanah Asli')
+        ax.grid(True); st.pyplot(fig)
+        st.download_button("📥 DXF Long (Std KP)", generate_dxf((ogl, []), "long"), "Long_KP.dxf", mime="application/dxf")
+    else:
+        st.info("Belum ada data Long Section.")
+
+# --- TAB 4: CROSS SECTION ---
+with tabs[3]:
     col_in, col_view = st.columns([1, 2])
     with col_in:
-        st.subheader("Input Data PCLP")
+        st.subheader("Input Data PCLP (Manual)")
         f_upload = st.file_uploader("Upload Excel", type=['xls', 'xlsx'], key='cross_up')
         if f_upload:
             try:
@@ -281,115 +398,37 @@ with tabs[0]:
             except: st.error("Gagal baca file.")
 
     with col_view:
-        if 'data_cross' in st.session_state:
-            data = st.session_state['data_cross']
-            idx = st.slider("Pilih STA", 0, len(data)-1, 0)
-            item = data[idx]
-            fig, ax = plt.subplots(figsize=(10, 4))
-            if item['points_tanah']: ax.plot(*zip(*item['points_tanah']), 'k-o', label='Tanah')
-            if item['points_desain']: ax.plot(*zip(*item['points_desain']), 'r-', label='Desain')
-            ax.set_title(f"{item['STA']} | C:{item['cut']:.2f} | F:{item['fill']:.2f}")
-            ax.legend(); ax.grid(True); st.pyplot(fig)
+        # --- LOGIKA BARU: ANTI CRASH UNTUK DATA TUNGGAL ---
+        data = st.session_state.get('data_cross', [])
+        
+        # 1. Jika data kosong
+        if not data:
+            st.info("⚠️ Belum ada data Cross Section.")
+            st.caption("Silakan upload file Excel di panel kiri atau lakukan ekstraksi di Tab GIS.")
+        
+        # 2. Jika data ADA (minimal 1)
+        else:
+            jml_data = len(data)
             
-            c1, c2 = st.columns(2)
-            c1.download_button("📥 DXF Cross", generate_dxf(data, "cross"), "Cross.dxf")
-            c2.download_button("📥 Excel Report", generate_excel_report(data), "Vol_Report.xlsx")
-
-# --- TAB 2: LONG SECTION ---
-with tabs[1]:
-    st.subheader("Long Section")
-    f_long = st.file_uploader("Upload Long", type=['xls', 'xlsx', 'csv'], key='long_up')
-    if f_long:
-        try:
-            df = pd.read_csv(f_long) if f_long.name.endswith('.csv') else pd.read_excel(f_long)
-            st.session_state['long_res'] = (df.iloc[:, :2].dropna().values.tolist(), [])
-            st.success("Data masuk!")
-        except: st.error("Error file.")
-
-    if 'long_res' in st.session_state:
-        ogl, _ = st.session_state['long_res']
-        with st.expander("Lihat Data Tabel"):
-            st.dataframe(pd.DataFrame(ogl, columns=["Jarak (m)", "Elevasi (m)"]))
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(*zip(*ogl), 'k--', label='Tanah Asli')
-        ax.grid(True); st.pyplot(fig)
-        st.download_button("📥 DXF Long", generate_dxf((ogl, []), "long"), "Long.dxf")
-
-# --- TAB 3: PETA SITUASI (AUTO CROSS SECTION) ---
-with tabs[2]:
-    st.header("🗺️ Peta Situasi & Ekstraksi Data")
-    
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        up_dem = st.file_uploader("Upload DEM (.tif)", type=['tif', 'tiff'])
-        up_shp = st.file_uploader("Upload Trase (.geojson/.shp)", type=['geojson', 'shp'], accept_multiple_files=True)
-        
-        st.markdown("---")
-        st.write("⚙️ **Pengaturan Sampling**")
-        interval = st.number_input("Interval Antar STA (m)", 5, 1000, 25, 5)
-        
-        col_w1, col_w2 = st.columns(2)
-        w_left = col_w1.number_input("Lebar Kiri (m)", 5, 100, 25, 5)
-        w_right = col_w2.number_input("Lebar Kanan (m)", 5, 100, 25, 5)
-        
-        shp_file = None
-        if up_shp:
-            for f in up_shp:
-                if f.name.endswith('.geojson') or f.name.endswith('.shp'): shp_file = f; break
-        
-        btn_render = st.button("1. Tampilkan Peta")
-        btn_long = st.button("2. Ekstrak Long Section")
-        btn_cross = st.button("3. Ekstrak Cross Section (Auto)")
-
-    with c2:
-        if btn_render and up_dem and shp_file:
-            st.session_state['gis_files'] = (up_dem, shp_file)
-        
-        if 'gis_files' in st.session_state:
-            dem, shp = st.session_state['gis_files']
-            dem.seek(0); shp.seek(0)
-            with st.spinner("Merender Peta..."):
-                fig, err = render_peta_situasi(dem, shp)
-                if fig: st.pyplot(fig)
-                else: st.error(err)
-
-        # EKSTRAK LONG SECTION
-        if btn_long and up_dem and shp_file:
-            up_dem.seek(0); shp_file.seek(0)
-            with st.spinner(f"Extracting Long Section ({interval}m)..."):
-                df_long, err = extract_long_section_from_dem(up_dem, shp_file, interval)
-                if df_long is not None:
-                    st.success(f"✅ Long Section: {len(df_long)} titik")
-                    # Kirim ke Tab 2
-                    long_data = df_long[['Station (m)', 'Elevation (m)']].dropna().values.tolist()
-                    st.session_state['long_res'] = (long_data, [])
-                    st.info("Data dikirim ke Tab 'LONG SECTION'.")
-                    
-                    # Download Excel
-                    out = io.BytesIO()
-                    df_long.to_excel(out, index=False)
-                    st.download_button("📥 Download Excel Long", out.getvalue(), "Long_Section.xlsx")
-
-        # EKSTRAK CROSS SECTION
-        if btn_cross and up_dem and shp_file:
-            up_dem.seek(0); shp_file.seek(0)
-            with st.spinner(f"Generating Cross Sections (L:{w_left}m, R:{w_right}m)..."):
-                app_data, df_civil, err = extract_cross_section_from_dem(up_dem, shp_file, interval, w_left, w_right)
+            # --- PENANGANAN KHUSUS JIKA HANYA 1 DATA ---
+            if jml_data == 1:
+                idx = 0
+                st.info(f"Menampilkan Single Cross Section: {data[0]['STA']}")
+            
+            # --- JIKA DATA > 1, BARU PAKAI SLIDER ---
+            else:
+                # max_value pasti >= 1, jadi slider aman
+                idx = st.slider("Pilih STA", 0, jml_data - 1, 0)
+            
+            # --- RENDER GRAFIK ---
+            if 0 <= idx < jml_data:
+                item = data[idx]
+                fig, ax = plt.subplots(figsize=(10, 4))
+                if item['points_tanah']: ax.plot(*zip(*item['points_tanah']), 'k-o', label='Tanah')
+                if item['points_desain']: ax.plot(*zip(*item['points_desain']), 'r-', label='Desain')
+                ax.set_title(f"{item['STA']} | C:{item['cut']:.2f} | F:{item['fill']:.2f}")
+                ax.legend(); ax.grid(True); st.pyplot(fig)
                 
-                if app_data:
-                    st.success(f"✅ Berhasil membuat {len(app_data)} Cross Section!")
-                    
-                    # 1. Kirim ke Tab 1 (Viewer)
-                    st.session_state['data_cross'] = app_data
-                    st.info("Grafik dikirim ke Tab 'CROSS SECTION' untuk dipreview.")
-                    
-                    # 2. Download Excel Civil 3D
-                    out_csv = io.BytesIO()
-                    df_civil.to_excel(out_csv, index=False)
-                    st.download_button("📥 Download Excel (Format Civil 3D)", out_csv.getvalue(), "Cross_Section_Civil3D.xlsx")
-                    
-                    # 3. Download DXF
-                    dxf_bytes = generate_dxf(app_data, "cross")
-                    st.download_button("📥 Download DXF (AutoCAD)", dxf_bytes, "Cross_Section_Auto.dxf")
-                else:
-                    st.error(f"Gagal: {err}")
+                c1, c2 = st.columns(2)
+                c1.download_button("📥 DXF Cross (Std KP)", generate_dxf(data, "cross"), "Cross_KP.dxf", mime="application/dxf")
+                c2.download_button("📥 Excel Report", generate_excel_report(data), "Vol_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
